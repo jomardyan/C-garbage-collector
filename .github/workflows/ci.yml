@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "GCC 12 – Release"
+            os: ubuntu-22.04
+            cc: gcc-12
+            cxx: g++-12
+            build_type: Release
+            extra_cmake: ""
+
+          - name: "Clang 15 – Release"
+            os: ubuntu-22.04
+            cc: clang-15
+            cxx: clang++-15
+            build_type: Release
+            extra_cmake: ""
+
+          - name: "Clang 15 – ASan + UBSan"
+            os: ubuntu-22.04
+            cc: clang-15
+            cxx: clang++-15
+            build_type: RelWithDebInfo
+            extra_cmake: "-DGC_ENABLE_ASAN=ON"
+
+          - name: "Clang 15 – TSan"
+            os: ubuntu-22.04
+            cc: clang-15
+            cxx: clang++-15
+            build_type: RelWithDebInfo
+            extra_cmake: "-DGC_ENABLE_TSAN=ON"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake ninja-build
+          if [[ "${{ matrix.cxx }}" == clang* ]]; then
+            sudo apt-get install -y "${{ matrix.cc }}" "${{ matrix.cxx }}" || \
+              (wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 15)
+          fi
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            ${{ matrix.extra_cmake }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --parallel 1

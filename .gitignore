@@ -1,3 +1,36 @@
+# Build directories
 build/
+build_orig/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.cmake
+!cmake/GCLibConfig.cmake.in
+
+# Compiled binaries
+*.o
+*.a
+*.so
+*.dylib
+gc_demo
+gc_tests
+
+# IDE / editor
 .vscode/.browse.VC.db*
 .vscode/*.log
+.vscode/ipch/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Clangd / compile commands
+compile_commands.json
+.clangd/
+
