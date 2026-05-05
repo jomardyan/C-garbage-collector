@@ -11,8 +11,7 @@
 
 namespace gc {
 
-// --- gc_new<T> ---
-
+/// Allocates and constructs one GC-managed object.
 template <typename T, typename... Args>
 gc_ptr<T> gc_new(Args&&... args) {
     static_assert(!std::is_array_v<T>, "Use gc_new_array<T>(count) for arrays.");
@@ -35,8 +34,7 @@ gc_ptr<T> gc_new(Args&&... args) {
     return result;
 }
 
-// --- gc_new_nothrow<T> ---
-
+/// Allocates and constructs one GC-managed object, returning null on failure.
 template <typename T, typename... Args>
 gc_ptr<T> gc_new_nothrow(Args&&... args) noexcept {
     try {
@@ -46,16 +44,13 @@ gc_ptr<T> gc_new_nothrow(Args&&... args) noexcept {
     }
 }
 
-// --- gc_new_array<T> ---
-//
-// Layout of the allocated GC block:
-//   [ size_t count ][ T elem[0] ][ T elem[1] ] ... [ T elem[count-1] ]
-//
-// The gc_ptr<T[]> returned points to elem[0] (an interior pointer relative
-// to the block's payload_begin).  find_block_locked() accepts interior
-// pointers, so the GC correctly traces and collects the block.
-//
-// The destructor uses the count prefix to destroy all elements in reverse order.
+/// Allocates a GC-managed array of default-constructed elements.
+///
+/// Layout of the allocated GC block:
+///   [ size_t count ][ T elem[0] ][ T elem[1] ] ... [ T elem[count-1] ]
+///
+/// The returned gc_ptr<T[]> points at elem[0], and the collector resolves that
+/// interior pointer back to the owning allocation during tracing.
 
 namespace detail {
 

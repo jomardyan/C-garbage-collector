@@ -6,6 +6,7 @@
 
 namespace gc {
 
+/// Non-owning strong handle to a GC-managed object.
 template <typename T>
 class gc_ptr {
 public:
@@ -54,7 +55,7 @@ private:
     T* ptr_ = nullptr;
 };
 
-// --- Specialisation for arrays ---
+/// Array specialization used by gc_new_array().
 template <typename T>
 class gc_ptr<T[]> {
 public:
@@ -102,17 +103,19 @@ constexpr void swap(gc_ptr<T>& lhs, gc_ptr<T>& rhs) noexcept {
     rhs.reset(tmp);
 }
 
-// --- Cast helpers (mirrors std::shared_ptr cast functions) ---
+/// Casts a gc_ptr using static_cast semantics.
 template <typename To, typename From>
 gc_ptr<To> static_gc_ptr_cast(const gc_ptr<From>& p) noexcept {
     return gc_ptr<To>(static_cast<To*>(p.get()));
 }
 
+/// Casts a gc_ptr using dynamic_cast semantics.
 template <typename To, typename From>
 gc_ptr<To> dynamic_gc_ptr_cast(const gc_ptr<From>& p) noexcept {
     return gc_ptr<To>(dynamic_cast<To*>(p.get()));
 }
 
+/// Casts away constness from a gc_ptr target.
 template <typename To, typename From>
 gc_ptr<To> const_gc_ptr_cast(const gc_ptr<From>& p) noexcept {
     return gc_ptr<To>(const_cast<To*>(p.get()));

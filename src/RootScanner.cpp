@@ -20,6 +20,14 @@
 namespace gc {
 namespace {
 
+#if defined(_MSC_VER)
+#define GC_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define GC_NOINLINE __attribute__((noinline))
+#else
+#define GC_NOINLINE
+#endif
+
 void scan_words(const void* begin,
                 const void* end,
                 const RootScanner::CandidateVisitor& visitor) {
@@ -41,7 +49,67 @@ void scan_words(const void* begin,
 // setjmp flushes caller-saved registers into the jmp_buf on most ABIs (x86-64,
 // AArch64, RISC-V).  On some ABIs a register window may be missed; the
 // conservative stack scan below provides a second line of defence.
-void scan_registers(const RootScanner::CandidateVisitor& visitor) {
+void clear_transient_registers() noexcept {
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+    __asm__ __volatile__(
+        "xor %%rax, %%rax\n\t"
+        "xor %%rcx, %%rcx\n\t"
+        "xor %%rdx, %%rdx\n\t"
+        "xor %%rsi, %%rsi\n\t"
+        "xor %%r8, %%r8\n\t"
+        "xor %%r9, %%r9\n\t"
+        "xor %%r10, %%r10\n\t"
+        "xor %%r11, %%r11\n\t"
+        :
+        :
+        : "rax", "rcx", "rdx", "rsi", "r8", "r9", "r10", "r11", "memory");
+#elif (defined(__GNUC__) || defined(__clang__)) && defined(__aarch64__)
+    __asm__ __volatile__(
+        "mov x1, xzr\n\t"
+        "mov x2, xzr\n\t"
+        "mov x3, xzr\n\t"
+        "mov x4, xzr\n\t"
+        "mov x5, xzr\n\t"
+        "mov x6, xzr\n\t"
+        "mov x7, xzr\n\t"
+        "mov x8, xzr\n\t"
+        "mov x9, xzr\n\t"
+        "mov x10, xzr\n\t"
+        "mov x11, xzr\n\t"
+        "mov x12, xzr\n\t"
+        "mov x13, xzr\n\t"
+        "mov x14, xzr\n\t"
+        "mov x15, xzr\n\t"
+        "mov x16, xzr\n\t"
+        "mov x17, xzr\n\t"
+        :
+        :
+        : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
+          "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+#endif
+}
+
+GC_NOINLINE void scan_registers_frame(
+    const RootScanner::CandidateVisitor& visitor,
+    std::uintptr_t zero0,
+    std::uintptr_t zero1,
+    std::uintptr_t zero2,
+    std::uintptr_t zero3,
+    std::uintptr_t zero4,
+    std::uintptr_t zero5,
+    std::uintptr_t zero6,
+    std::uintptr_t zero7) {
+    (void)zero0;
+    (void)zero1;
+    (void)zero2;
+    (void)zero3;
+    (void)zero4;
+    (void)zero5;
+    (void)zero6;
+    (void)zero7;
+
+    clear_transient_registers();
+
     std::jmp_buf registers;
     std::memset(&registers, 0, sizeof(registers));
     if (setjmp(registers) == 0) {
@@ -49,6 +117,10 @@ void scan_registers(const RootScanner::CandidateVisitor& visitor) {
             reinterpret_cast<const unsigned char*>(&registers) + sizeof(registers);
         scan_words(&registers, end, visitor);
     }
+}
+
+void scan_registers(const RootScanner::CandidateVisitor& visitor) {
+    scan_registers_frame(visitor, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U);
 }
 
 void scan_stack(const void* stack_bottom,

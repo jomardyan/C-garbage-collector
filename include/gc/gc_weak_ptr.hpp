@@ -8,6 +8,29 @@
 
 namespace gc {
 
+namespace detail {
+
+inline constexpr std::uintptr_t kWeakPtrMask =
+    static_cast<std::uintptr_t>(0x9E3779B97F4A7C10ULL);
+
+inline std::uintptr_t encode_weak_ptr(const void* ptr) noexcept {
+    if (ptr == nullptr) {
+        return 0U;
+    }
+    return (reinterpret_cast<std::uintptr_t>(ptr) ^ kWeakPtrMask) | 1U;
+}
+
+template <typename T>
+inline T* decode_weak_ptr(std::uintptr_t encoded) noexcept {
+    if (encoded == 0U) {
+        return nullptr;
+    }
+    const auto raw = (encoded & ~std::uintptr_t{1}) ^ kWeakPtrMask;
+    return reinterpret_cast<T*>(raw);
+}
+
+}  // namespace detail
+
 /// A non-owning handle to a GC-managed object.
 /// The pointer is nulled out automatically when the GC reclaims the target.
 /// gc_weak_ptrs must not outlive the GC_Manager singleton.
@@ -18,35 +41,35 @@ class gc_weak_ptr {
 public:
     gc_weak_ptr() noexcept = default;
 
-    explicit gc_weak_ptr(const gc_ptr<T>& p) : ptr_(p.get()) {
-        if (ptr_) {
+    explicit gc_weak_ptr(const gc_ptr<T>& p)
+        : encoded_ptr_(detail::encode_weak_ptr(p.get())) {
+        if (encoded_ptr_ != 0U) {
             GC_Manager::instance().register_weak_ref(
-                reinterpret_cast<std::uintptr_t>(ptr_),
-                reinterpret_cast<void**>(&ptr_));
+                reinterpret_cast<std::uintptr_t>(p.get()),
+                &encoded_ptr_);
         }
     }
 
     ~gc_weak_ptr() {
-        if (ptr_) {
-            GC_Manager::instance().unregister_weak_ref(
-                reinterpret_cast<void**>(&ptr_));
+        if (encoded_ptr_ != 0U) {
+            GC_Manager::instance().unregister_weak_ref(&encoded_ptr_);
         }
     }
 
-    gc_weak_ptr(const gc_weak_ptr& other) : ptr_(other.ptr_) {
-        if (ptr_) {
+    gc_weak_ptr(const gc_weak_ptr& other) : encoded_ptr_(other.encoded_ptr_) {
+        if (encoded_ptr_ != 0U) {
             GC_Manager::instance().register_weak_ref(
-                reinterpret_cast<std::uintptr_t>(ptr_),
-                reinterpret_cast<void**>(&ptr_));
+                reinterpret_cast<std::uintptr_t>(detail::decode_weak_ptr<T>(encoded_ptr_)),
+                &encoded_ptr_);
         }
     }
 
-    gc_weak_ptr(gc_weak_ptr&& other) noexcept : ptr_(other.ptr_) {
-        if (ptr_) {
+    gc_weak_ptr(gc_weak_ptr&& other) noexcept : encoded_ptr_(other.encoded_ptr_) {
+        if (encoded_ptr_ != 0U) {
             GC_Manager::instance().update_weak_ref(
-                reinterpret_cast<void**>(&other.ptr_),
-                reinterpret_cast<void**>(&ptr_));
-            other.ptr_ = nullptr;
+                &other.encoded_ptr_,
+                &encoded_ptr_);
+            other.encoded_ptr_ = 0U;
         }
     }
 
@@ -55,11 +78,11 @@ public:
             return *this;
         }
         reset();
-        ptr_ = other.ptr_;
-        if (ptr_) {
+        encoded_ptr_ = other.encoded_ptr_;
+        if (encoded_ptr_ != 0U) {
             GC_Manager::instance().register_weak_ref(
-                reinterpret_cast<std::uintptr_t>(ptr_),
-                reinterpret_cast<void**>(&ptr_));
+                reinterpret_cast<std::uintptr_t>(detail::decode_weak_ptr<T>(encoded_ptr_)),
+                &encoded_ptr_);
         }
         return *this;
     }
@@ -69,45 +92,51 @@ public:
             return *this;
         }
         reset();
-        ptr_ = other.ptr_;
-        if (ptr_) {
+        encoded_ptr_ = other.encoded_ptr_;
+        if (encoded_ptr_ != 0U) {
             GC_Manager::instance().update_weak_ref(
-                reinterpret_cast<void**>(&other.ptr_),
-                reinterpret_cast<void**>(&ptr_));
-            other.ptr_ = nullptr;
+                &other.encoded_ptr_,
+                &encoded_ptr_);
+            other.encoded_ptr_ = 0U;
         }
         return *this;
     }
 
     gc_weak_ptr& operator=(const gc_ptr<T>& p) {
         reset();
-        ptr_ = p.get();
-        if (ptr_) {
+        encoded_ptr_ = detail::encode_weak_ptr(p.get());
+        if (encoded_ptr_ != 0U) {
             GC_Manager::instance().register_weak_ref(
-                reinterpret_cast<std::uintptr_t>(ptr_),
-                reinterpret_cast<void**>(&ptr_));
+                reinterpret_cast<std::uintptr_t>(p.get()),
+                &encoded_ptr_);
         }
         return *this;
     }
 
     /// Returns a strong gc_ptr if the target is still alive, nullptr otherwise.
     gc_ptr<T> lock() const noexcept {
-        return ptr_ ? gc_ptr<T>(ptr_) : gc_ptr<T>();
+        T* ptr = detail::decode_weak_ptr<T>(encoded_ptr_);
+        if (ptr == nullptr) {
+            return gc_ptr<T>();
+        }
+        return GC_Manager::instance().is_live(ptr) ? gc_ptr<T>(ptr) : gc_ptr<T>();
     }
 
-    bool expired() const noexcept { return ptr_ == nullptr; }
+    bool expired() const noexcept {
+        return detail::decode_weak_ptr<T>(encoded_ptr_) == nullptr ||
+               !GC_Manager::instance().is_live(detail::decode_weak_ptr<T>(encoded_ptr_));
+    }
 
     void reset() noexcept {
-        if (ptr_) {
-            GC_Manager::instance().unregister_weak_ref(
-                reinterpret_cast<void**>(&ptr_));
-            ptr_ = nullptr;
+        if (encoded_ptr_ != 0U) {
+            GC_Manager::instance().unregister_weak_ref(&encoded_ptr_);
+            encoded_ptr_ = 0U;
         }
     }
 
 private:
-    // The GC nulls this out (via stored void**) when the target block is swept.
-    T* ptr_ = nullptr;
+    // Encoded so conservative root scanning does not treat weak refs as strong roots.
+    std::uintptr_t encoded_ptr_ = 0U;
 };
 
 }  // namespace gc

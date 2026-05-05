@@ -1,3 +1,4 @@
+#include <atomic>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -41,8 +42,8 @@ GC_NOINLINE std::uintptr_t consume_stack_noise(const std::uintptr_t* values,
 }
 
 GC_NOINLINE void scrub_stack(int depth = 2) {
-    std::uintptr_t noise[512] = {};
-    for (std::size_t index = 0; index < 512; ++index) {
+    std::uintptr_t noise[4096] = {};
+    for (std::size_t index = 0; index < 4096; ++index) {
         noise[index] = static_cast<std::uintptr_t>(index + depth);
     }
 
@@ -50,7 +51,7 @@ GC_NOINLINE void scrub_stack(int depth = 2) {
     __asm__ __volatile__("" : : "g"(noise) : "memory");
 #endif
 
-    const std::uintptr_t sink = consume_stack_noise(noise, 512);
+    const std::uintptr_t sink = consume_stack_noise(noise, 4096);
     if (sink == static_cast<std::uintptr_t>(-1)) {
         std::cerr << "unreachable\n";
     }
@@ -100,12 +101,32 @@ struct ReentrantNode {
 // Used to verify that a destructor that throws causes std::terminate.
 // (Not run in normal test flow — documented here for reference.)
 
+struct FinalizerDependencyNode {
+    static inline bool dependency_destroyed_too_early = false;
+    static inline bool destroyed[2] = {false, false};
+
+    explicit FinalizerDependencyNode(int identifier) : id(identifier) {}
+
+    gc::gc_ptr<FinalizerDependencyNode> dependency;
+    int id = 0;
+
+    ~FinalizerDependencyNode() {
+        if (dependency && destroyed[dependency->id]) {
+            dependency_destroyed_too_early = true;
+        }
+        destroyed[id] = true;
+    }
+};
+
 void reset_counts() {
     Node::destroyed = 0;
     Buffer::destroyed = 0;
     LargeBlob::destroyed = 0;
     OverAlignedBlob::destroyed = 0;
     ReentrantNode::ran = false;
+    FinalizerDependencyNode::dependency_destroyed_too_early = false;
+    FinalizerDependencyNode::destroyed[0] = false;
+    FinalizerDependencyNode::destroyed[1] = false;
 }
 
 void reset_gc() {
@@ -274,7 +295,7 @@ void test_registered_external_root_range() {
            "object should be reclaimed after unregistering the external root range");
 }
 
-void test_cross_thread_use_is_rejected() {
+void test_unregistered_cross_thread_use_is_rejected() {
     reset_gc();
 
     std::exception_ptr worker_error;
@@ -300,26 +321,91 @@ void test_cross_thread_use_is_rejected() {
     }
 
     expect(saw_logic_error,
-           "collector should reject cross-thread use until a real stop-the-world implementation exists");
+           "collector should reject GC use on threads that never register their stack bottom");
+}
+
+void test_registered_cross_thread_use_is_supported() {
+    reset_gc();
+
+    std::atomic<bool> ready{false};
+    std::atomic<bool> release{false};
+    std::atomic<std::uintptr_t> published{0U};
+    std::exception_ptr worker_error;
+
+    std::thread worker([&]() {
+        int worker_anchor = 0;
+        try {
+            gc::ScopedThreadRegistration registration(&worker_anchor);
+            auto rooted = gc::gc_new<Node>(77);
+
+            published.store(reinterpret_cast<std::uintptr_t>(rooted.get()),
+                            std::memory_order_release);
+            ready.store(true, std::memory_order_release);
+
+            while (!release.load(std::memory_order_acquire)) {
+                gc::safepoint();
+                std::this_thread::yield();
+            }
+
+            rooted.reset();
+            gc::safepoint();
+        } catch (...) {
+            worker_error = std::current_exception();
+            ready.store(true, std::memory_order_release);
+        }
+    });
+
+    while (!ready.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    if (worker_error != nullptr) {
+        worker.join();
+        std::rethrow_exception(worker_error);
+    }
+
+    auto* raw = reinterpret_cast<Node*>(published.load(std::memory_order_acquire));
+    expect(raw != nullptr, "worker should publish a live GC object");
+
+    auto& manager = gc::GC_Manager::instance();
+    manager.collect();
+
+    expect(manager.is_live(raw),
+           "registered worker thread roots should keep objects alive during collection");
+    expect(manager.managed_block_count() == 1U,
+           "registered cross-thread allocation should survive while the worker holds the root");
+
+        published.store(0U, std::memory_order_release);
+        raw = nullptr;
+
+    release.store(true, std::memory_order_release);
+    worker.join();
+
+    if (worker_error != nullptr) {
+        std::rethrow_exception(worker_error);
+    }
+
+    scrub_stack();
+    collect_until_stable();
+
+    expect(manager.managed_block_count() == 0U,
+           "registered cross-thread object should be reclaimable after the worker exits");
 }
 
 // ---- New tests --------------------------------------------------------------
 
-GC_NOINLINE void make_reentrant_node() {
-    auto obj = gc::gc_new<ReentrantNode>();
-    (void)obj;
-}
-
 void test_reentrant_collect_is_safe() {
     reset_gc();
 
-    make_reentrant_node();
-    scrub_stack();
-    collect_until_stable();
+    {
+        auto obj = gc::gc_new<ReentrantNode>();
+        obj.reset();
+    }
+    gc::GC_Manager::instance().shutdown();
 
     expect(ReentrantNode::ran, "ReentrantNode destructor should have run");
     expect(gc::GC_Manager::instance().managed_block_count() == 0U,
-           "block should be reclaimed; reentrant collect() should be a no-op");
+           "shutdown should reclaim the block; reentrant collect() should be a no-op");
 }
 
 void test_gc_new_nothrow() {
@@ -333,25 +419,23 @@ void test_gc_new_nothrow() {
     collect_until_stable();
 }
 
-GC_NOINLINE void make_and_verify_array() {
-    constexpr std::size_t count = 5U;
-    auto arr = gc::gc_new_array<Buffer>(count);
-    expect(arr.get() != nullptr, "gc_new_array should return a non-null pointer");
-    expect(gc::GC_Manager::instance().managed_block_count() == 1U,
-           "gc_new_array should create exactly one GC block");
-    arr[0].values[0] = 42;
-    expect(arr[0].values[0] == 42, "array element write/read should work");
-}
-
 void test_gc_new_array_basic() {
     reset_gc();
 
-    make_and_verify_array();
-    scrub_stack();
-    collect_until_stable();
+    constexpr std::size_t count = 5U;
+    {
+     auto arr = gc::gc_new_array<Buffer>(count);
+     expect(arr.get() != nullptr, "gc_new_array should return a non-null pointer");
+     expect(gc::GC_Manager::instance().managed_block_count() == 1U,
+         "gc_new_array should create exactly one GC block");
+     arr[0].values[0] = 42;
+     expect(arr[0].values[0] == 42, "array element write/read should work");
+     arr.reset();
+    }
+    gc::GC_Manager::instance().shutdown();
 
     expect(gc::GC_Manager::instance().managed_block_count() == 0U,
-           "array block should be reclaimed after last reference is dropped");
+        "shutdown should reclaim the array block");
     expect(Buffer::destroyed >= 5,
            "all array element destructors should run");
 }
@@ -531,6 +615,58 @@ void test_gc_stats() {
     expect(after.bytes_reclaimed_total > 0U, "bytes_reclaimed_total should be non-zero");
 }
 
+    void test_heap_snapshot_and_fragmentation_stats() {
+        reset_gc();
+
+        auto object = gc::gc_new<OverAlignedBlob>();
+        auto& manager = gc::GC_Manager::instance();
+
+        const auto snapshot = manager.live_objects();
+        expect(snapshot.size() == 1U, "heap snapshot should report one live object");
+        expect(snapshot[0].payload == object.get(),
+            "heap snapshot should report the live payload address");
+        expect(snapshot[0].payload_size == sizeof(OverAlignedBlob),
+            "heap snapshot should report the payload size");
+        expect(snapshot[0].reserved_size >= snapshot[0].payload_size,
+            "reserved bytes should include at least the payload size");
+
+        const auto stats = manager.stats();
+        expect(stats.live_blocks == 1U, "stats should report one live block");
+        expect(stats.live_bytes == sizeof(OverAlignedBlob),
+            "stats should report the live payload bytes");
+        expect(stats.reserved_bytes >= stats.live_bytes,
+            "reserved bytes should be at least the live payload bytes");
+        expect(stats.fragmentation_ratio >= 0.0 && stats.fragmentation_ratio < 1.0,
+            "fragmentation ratio should be normalized to [0, 1)");
+
+        object.reset();
+        manager.shutdown();
+
+        expect(manager.live_objects().empty(), "heap snapshot should be empty after shutdown");
+    }
+
+    void test_dependency_aware_shutdown_finalization() {
+        reset_gc();
+
+        {
+         auto dependent = gc::gc_new<FinalizerDependencyNode>(0);
+         auto dependency = gc::gc_new<FinalizerDependencyNode>(1);
+         dependent->dependency = dependency;
+
+         // Drop the handles in an order that used to be unsafe under pure address-order
+         // destruction: the dependent was allocated first and points at a later block.
+         dependency.reset();
+         dependent.reset();
+        }
+
+        gc::GC_Manager::instance().shutdown();
+
+        expect(!FinalizerDependencyNode::dependency_destroyed_too_early,
+            "dependents should be finalized before the objects they reference");
+        expect(FinalizerDependencyNode::destroyed[0] && FinalizerDependencyNode::destroyed[1],
+            "shutdown should destroy both dependency-ordered objects");
+    }
+
 void test_release_unconstructed_unknown_pointer() {
     reset_gc();
 
@@ -557,7 +693,10 @@ int run_all_tests() {
         {"threshold trigger",               test_threshold_trigger},
         {"over-aligned allocation",         test_over_aligned_allocation},
         {"registered external root range",  test_registered_external_root_range},
-        {"cross-thread use is rejected",    test_cross_thread_use_is_rejected},
+        {"unregistered cross-thread use is rejected",
+                            test_unregistered_cross_thread_use_is_rejected},
+        {"registered cross-thread use is supported",
+                            test_registered_cross_thread_use_is_supported},
         // New tests
         {"reentrant collect is safe",       test_reentrant_collect_is_safe},
         {"gc_new_nothrow",                  test_gc_new_nothrow},
@@ -570,6 +709,10 @@ int run_all_tests() {
         {"gc_ptr STL compatibility",        test_gc_ptr_stl_compatibility},
         {"gc_ptr casts",                    test_gc_ptr_casts},
         {"GC stats",                        test_gc_stats},
+        {"heap snapshot and fragmentation stats",
+                                            test_heap_snapshot_and_fragmentation_stats},
+        {"dependency-aware shutdown finalization",
+                                            test_dependency_aware_shutdown_finalization},
         {"release_unconstructed unknown",   test_release_unconstructed_unknown_pointer},
     };
 

@@ -20,6 +20,7 @@ struct alignas(8) ChunkHeader {
     // Atomic so concurrent/incremental marking never races on this flag.
     std::atomic<std::uint8_t> marked{0};
     std::uint8_t alignment_shift = 0;
+    std::uint8_t reserved[8] = {};
 
     bool is_marked() const noexcept {
         return marked.load(std::memory_order_relaxed) != 0U;
@@ -38,8 +39,10 @@ struct alignas(8) ChunkHeader {
     }
 };
 
-static_assert(sizeof(ChunkHeader) >= 16 && sizeof(ChunkHeader) <= 32,
-              "ChunkHeader has an unexpected size; update padding check if layout changes.");
+static_assert(sizeof(ChunkHeader) == 32,
+              "ChunkHeader layout changed; update allocator metadata assumptions.");
+static_assert(std::has_single_bit(sizeof(ChunkHeader)),
+              "ChunkHeader size must stay a power of two.");
 static_assert(sizeof(ChunkHeader) % alignof(ChunkHeader) == 0,
               "ChunkHeader size must preserve payload alignment.");
 
