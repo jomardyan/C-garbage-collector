@@ -1,0 +1,54 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "configure",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "-S",
+        ".",
+        "-B",
+        "build"
+      ],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "--build",
+        "build"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "dependsOn": "configure",
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "run",
+      "type": "shell",
+      "command": "./build/gc_demo",
+      "dependsOn": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "test",
+      "type": "shell",
+      "command": "ctest",
+      "args": [
+        "--test-dir",
+        "build",
+        "--output-on-failure"
+      ],
+      "dependsOn": "build",
+      "problemMatcher": []
+    }
+  ]
+}
