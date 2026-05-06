@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 #include "gc/GC.hpp"
@@ -26,9 +27,21 @@ struct Node {
 };
 
 GC_NOINLINE void scrub_stack() {
-    volatile std::uintptr_t noise[256] = {};
+    std::uintptr_t noise[256] = {};
     for (std::size_t index = 0; index < 256; ++index) {
         noise[index] = index;
+    }
+
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__ __volatile__("" : : "g"(noise) : "memory");
+#endif
+
+    std::uintptr_t sink = 0;
+    for (std::size_t index = 0; index < 256; ++index) {
+        sink ^= noise[index];
+    }
+    if (sink == static_cast<std::uintptr_t>(-1)) {
+        std::cout << "unreachable\n";
     }
 }
 
@@ -43,11 +56,12 @@ GC_NOINLINE void build_unreachable_cycle() {
 
 int main(int argc, char** argv) {
     (void)argv;
+    (void)argc;
 
-    gc::register_stack_bottom(&argc);
+    gc::register_current_thread();
     auto& manager = gc::GC_Manager::instance();
 
-    auto root = gc::gc_new<Node>("root");
+    gc::gc_root<Node> root(gc::gc_new<Node>("root"));
     root->next = gc::gc_new<Node>("child");
 
     std::cout << "Managed blocks before collection: "
@@ -61,6 +75,10 @@ int main(int argc, char** argv) {
     manager.collect();
     std::cout << "Managed blocks after reclaiming an unreachable cycle: "
               << manager.managed_block_count() << '\n';
+
+    std::ostringstream snapshot;
+    manager.dump_heap(snapshot);
+    std::cout << snapshot.str();
 
     root.reset();
     scrub_stack();

@@ -1,0 +1,47 @@
+Start testing: May 06 10:36 UTC
+----------------------------------------------------------
+1/1 Testing: gc_tests
+1/1 Test: gc_tests
+Command: "/workspaces/C-garbage-collector/build_asan/gc_tests"
+Directory: /workspaces/C-garbage-collector/build_asan
+"gc_tests" start time: May 06 10:36 UTC
+Output:
+----------------------------------------------------------
+[PASS] cycle reclamation
+[PASS] reachable chain
+[PASS] deep reachable chain
+[PASS] interior pointer
+[PASS] unaligned interior pointer
+[PASS] threshold trigger
+[PASS] over-aligned allocation
+[PASS] registered external root range
+[PASS] gc_root exact rooting
+[PASS] unregistered cross-thread use is rejected
+[PASS] registered cross-thread use is supported
+[PASS] reentrant collect is safe
+[PASS] gc_new_nothrow
+[PASS] gc_new_array basic
+[PASS] gc_new_array zero count
+[PASS] gc_new_array nothrow
+[PASS] gc_new_array over-aligned elements
+[PASS] gc_weak_ptr basic
+[PASS] gc_weak_ptr copy
+[PASS] gc_weak_ptr move
+[PASS] gc_weak_ptr reset
+[PASS] gc_ptr STL compatibility
+[PASS] gc_ptr array STL compatibility
+[PASS] gc_ptr casts
+[PASS] GC stats
+[PASS] heap dump includes object graph
+[PASS] heap snapshot and fragmentation stats
+[PASS] dependency-aware shutdown finalization
+[PASS] release_unconstructed unknown
+<end of output>
+Test time =   0.48 sec
+----------------------------------------------------------
+Test Passed.
+"gc_tests" end time: May 06 10:36 UTC
+"gc_tests" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: May 06 10:36 UTC

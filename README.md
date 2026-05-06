@@ -1,101 +1,100 @@
 # C-garbage-collector
 
-A C++20 workspace for `GC-Lib`, a conservative mark-and-sweep garbage collector with a thread-safe Global Allocation Map, a `gc_ptr<T>` handle, and a `gc_new<T>()` factory.
+`GC-Lib` is a C++20 conservative mark-and-sweep collector with interior-pointer lookup, weak references, array allocation, cooperative multi-thread stop-the-world collection, installable CMake package metadata, and a test/CI setup suitable for library development.
 
-This codebase is now a hardened single-owner conservative collector implementation. It is substantially stronger than the original demo, but it is not yet a fully production-grade multi-threaded garbage collector.
+It is substantially more capable than the original demo collector. It now provides automatic thread registration helpers, weak-pointer invalidation, array allocation, heap inspection APIs, dependency-aware finalization ordering, and cross-platform global scanning on Linux, macOS, and Windows.
 
 ## Features
 
+- Conservative mark-and-sweep collection with iterative marking.
 - Hidden `ChunkHeader` metadata on every managed allocation.
-- Thread-safe Global Allocation Map backed by `std::map` for `O(log n)` interior-pointer lookup.
-- Conservative root scanning through register dumps, stack scanning, and Linux global/static segment scanning.
-- Explicit root-range registration for heap-hosted or platform-specific roots.
-- `gc_ptr<T>` pointer wrapper with zero reference counting.
-- `gc_new<T>()` factory that triggers collection when managed memory reaches 10 MB.
-- Iterative mark worklist to avoid recursive collector stack overflows on deep object graphs.
-- Over-aligned payload allocation support.
-- VS Code build/debug configuration.
-- Test suite covering cycles, reachability, interior pointers, and threshold-triggered collection.
-
-## Project Layout
-
-```text
-.
-├── CMakeLists.txt
-├── include/
-│   └── gc/
-│       ├── ChunkHeader.hpp
-│       ├── GC.hpp
-│       ├── GCManager.hpp
-│       ├── RootScanner.hpp
-│       ├── gc_new.hpp
-│       └── gc_ptr.hpp
-├── src/
-│   ├── GCManager.cpp
-│   ├── RootScanner.cpp
-│   └── main.cpp
-├── tests/
-│   └── gc_tests.cpp
-└── .vscode/
-│   ├── extensions.json
-│   ├── launch.json
-│   ├── settings.json
-│   └── tasks.json
-```
+- Interior-pointer lookup through a global allocation map.
+- Automatic threshold-triggered collection via `collect_if_needed()`.
+- `gc_ptr<T>` strong handles with STL ordering/hash support.
+- `gc_root<T>` exact RAII roots for optimization-robust local rooting.
+- `gc_weak_ptr<T>` weak handles that are nulled during sweep/shutdown.
+- `gc_new<T>()`, `gc_new_nothrow<T>()`, `gc_new_array<T>()`, and `gc_new_array_nothrow<T>()`.
+- Over-aligned allocation support.
+- Cooperative multi-thread stop-the-world collection using per-thread registration and safepoints.
+- Automatic current-thread registration through `gc::register_current_thread()` or `gc::ScopedThreadRegistration`.
+- Explicit root-range registration for heap-hosted or external roots.
+- Heap inspection APIs through `GC_Manager::live_objects()` and `GC_Manager::dump_heap()`.
+- Collection statistics including reclaimed bytes, durations, live bytes, reserved bytes, and fragmentation ratio.
+- Dependency-aware finalization ordering during sweep and shutdown.
+- Cross-platform global/static scanning on Linux, macOS, and Windows.
+- CMake install/export support and CI sanitizer builds.
 
 ## Quick Start
 
-Call `gc::register_stack_bottom(&argc);` once near the top of `main`, then allocate through `gc::gc_new<T>()`.
+The easiest way to start a single-threaded program is automatic thread registration:
 
 ```cpp
 #include "gc/GC.hpp"
 
-int main(int argc, char** argv) {
-    (void)argv;
-    gc::register_stack_bottom(&argc);
+int main() {
+    gc::register_current_thread();
 
-    auto node = gc::gc_new<MyNode>();
-    gc::GC_Manager::instance().collect();
+    gc::gc_root<MyNode> root(gc::gc_new<MyNode>());
+    root->next = gc::gc_new<MyNode>();
+
+    gc::collect();
+    gc::shutdown();
 }
 ```
 
-Objects stay alive while a raw pointer value remains visible to the conservative root scan, including through `gc_ptr<T>` values stored on the stack or embedded inside other GC-managed objects.
+If you already know the stack anchor you want to use, you can still register it explicitly:
 
-For roots stored outside scanned stack/global memory, explicitly register their address range:
+```cpp
+int main(int argc, char** argv) {
+    (void)argv;
+    gc::register_stack_bottom(&argc);
+}
+```
+
+For local variables that must stay alive across optimized builds without relying on conservative register discovery, prefer `gc_root<T>` over a plain stack `gc_ptr<T>`.
+
+## Multi-Threaded Use
+
+Every mutator thread must register before using the GC. The RAII helper is the easiest way to do that:
+
+```cpp
+void worker() {
+    gc::ScopedThreadRegistration registration;
+
+    auto object = gc::gc_new<MyNode>();
+    while (running) {
+        gc::safepoint();
+        do_work(object);
+    }
+}
+```
+
+The collector uses a cooperative stop-the-world model. Registered worker threads must either be inside GC API calls or periodically call `gc::safepoint()` so collection can park them and scan their stacks.
+
+## Explicit Roots
+
+For roots stored outside scanned stack or global memory, register the containing range explicitly:
 
 ```cpp
 auto external_root = std::make_unique<gc::gc_ptr<MyNode>>();
 *external_root = gc::gc_new<MyNode>();
 
 gc::GC_Manager::instance().register_root_object(external_root.get());
-gc::GC_Manager::instance().collect();
+gc::collect();
 gc::GC_Manager::instance().unregister_root_object(external_root.get());
 ```
 
-## Collector Design
+## Debugging and Introspection
 
-1. Allocation prefixes each payload with a compact `ChunkHeader`.
-2. The Global Allocation Map stores `[payload_begin, payload_end)` ranges in a `std::map`.
-3. The mark phase scans registers, the active stack, and supported global/static regions.
-4. The sweep phase calls destructors first and frees memory afterward.
+```cpp
+auto stats = gc::GC_Manager::instance().stats();
+auto live = gc::GC_Manager::instance().live_objects();
+gc::GC_Manager::instance().dump_heap(std::cout);
+```
 
-## Cross-Platform Notes
-
-- Linux: global/static scanning is implemented by parsing `/proc/self/maps` and scanning writable file-backed segments.
-- Non-Linux targets: stack and register scanning still work, and explicit root-range registration remains available, but automatic global/static scanning currently falls back to a no-op.
-- The collector deliberately skips `[heap]` during root discovery so GC bookkeeping does not keep every allocation alive.
-
-## Limitations
-
-- Conservative scanning may retain objects longer than expected if a non-pointer word looks like a managed address.
-- Bit-masking or otherwise disguising pointers is not supported.
-- Collection is intentionally restricted to a single owner thread until a real multi-threaded stop-the-world implementation exists.
-- Automatic root scanning for globals is Linux-specific today.
-- The collector still lacks a true multi-thread suspend/resume mechanism, write barriers, compaction, and generational policies.
+`live_objects()` returns per-object payload size, reserved size, alignment, mark state, and outgoing references. `dump_heap()` emits a human-readable heap snapshot and object graph.
 
 ## Build and Run
-
-### Command line
 
 ```bash
 cmake -S . -B build
@@ -104,15 +103,38 @@ ctest --test-dir build --output-on-failure
 ./build/gc_demo
 ```
 
-### VS Code
+The library also exposes install/export metadata for downstream CMake consumers:
 
-- Install recommended extensions when prompted.
-- Run `Terminal -> Run Task -> build`.
-- Run `Terminal -> Run Task -> test` to execute the suite.
-- Press `F5` and choose `Debug gc_demo`.
+```bash
+cmake -S . -B build
+cmake --build build
+cmake --install build --prefix /tmp/gclib-install
+```
 
-## Next Steps
+## Platform Notes
 
-- Add per-thread stack registration for multi-threaded stop-the-world support.
-- Add optional explicit root handles to reduce false-positive retention.
-- Add a real multi-thread thread-registration and suspension layer instead of single-owner enforcement.
+- Linux scans writable file-backed mappings from `/proc/self/maps` and skips `[heap]` so collector bookkeeping does not self-root the heap.
+- macOS scans selected `__DATA` and `__DATA_CONST` sections from loaded Mach-O images.
+- Windows scans committed read-write PE image sections through `VirtualQuery`.
+- AddressSanitizer builds disable Linux writable-mapping global scanning and run tests with `detect_stack_use_after_return=0`, because ASan fake-stack instrumentation conflicts with conservative stack scanning.
+- Unsupported platforms still support stack scanning and explicit root registration, but automatic global scanning is disabled.
+
+## Limitations
+
+- This is still a conservative collector. Non-pointer bit patterns that look like managed addresses can retain objects longer than expected.
+- Cooperative stop-the-world is not the same as preemptive OS-level thread suspension. Threads that never hit GC APIs or `gc::safepoint()` can delay collection.
+- The collector does not compact, move, or generationally age objects.
+- There are no write barriers, incremental barriers, or exact compiler-provided root maps.
+- Encoded or disguised pointers are not tracked.
+
+## Project Layout
+
+```text
+.
+├── CMakeLists.txt
+├── cmake/
+├── include/gc/
+├── src/
+├── tests/
+└── .github/workflows/
+```

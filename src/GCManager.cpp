@@ -8,8 +8,17 @@
 #include <cstdlib>
 #include <limits>
 #include <new>
+#include <ostream>
 #include <queue>
 #include <stdexcept>
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #include "gc/RootScanner.hpp"
 
@@ -54,24 +63,43 @@ std::size_t block_allocation_size(const ChunkHeader* header) noexcept {
     return static_cast<std::size_t>(header->payload_offset) + header->size;
 }
 
-// RAII guard that resets the atomic collecting_ flag on scope exit.
-// Works without holding the mutex, so it is safe across destroy_blocks().
-struct CollectingGuard {
-    std::atomic<bool>& flag;
-    bool active = true;
-
-    explicit CollectingGuard(std::atomic<bool>& f) : flag(f) {}
-
-    // Called explicitly when we want to release early (collect() re-acquires
-    // the lock once more after destroy_blocks; we disarm the guard first).
-    void disarm() noexcept { active = false; }
-
-    ~CollectingGuard() {
-        if (active) {
-            flag.store(false, std::memory_order_release);
-        }
+const void* detect_current_thread_stack_bottom() {
+#if defined(__linux__)
+    pthread_attr_t attributes;
+    if (pthread_getattr_np(pthread_self(), &attributes) != 0) {
+        throw std::logic_error("GC-Lib could not query the current thread stack bounds.");
     }
-};
+
+    void* stack_base = nullptr;
+    std::size_t stack_size = 0U;
+    const int rc = pthread_attr_getstack(&attributes, &stack_base, &stack_size);
+    pthread_attr_destroy(&attributes);
+    if (rc != 0 || stack_base == nullptr || stack_size == 0U) {
+        throw std::logic_error("GC-Lib could not determine the current thread stack bounds.");
+    }
+
+    const auto high = reinterpret_cast<std::uintptr_t>(stack_base) + stack_size;
+    return reinterpret_cast<const void*>(high);
+#elif defined(__APPLE__)
+    const void* stack_high = pthread_get_stackaddr_np(pthread_self());
+    if (stack_high == nullptr) {
+        throw std::logic_error("GC-Lib could not determine the current thread stack bounds.");
+    }
+    return stack_high;
+#elif defined(_WIN32)
+    ULONG_PTR low = 0;
+    ULONG_PTR high = 0;
+    GetCurrentThreadStackLimits(&low, &high);
+    (void)low;
+    if (high == 0U) {
+        throw std::logic_error("GC-Lib could not determine the current thread stack bounds.");
+    }
+    return reinterpret_cast<const void*>(high);
+#else
+    throw std::logic_error(
+        "GC-Lib does not support automatic thread stack detection on this platform; use gc::register_stack_bottom().");
+#endif
+}
 
 }  // namespace
 
@@ -88,6 +116,10 @@ void GC_Manager::register_stack_bottom(const void* stack_bottom) {
     std::unique_lock<std::mutex> lock(mutex_);
     cooperate_with_stop_the_world_locked(lock);
     threads_[std::this_thread::get_id()].stack_bottom = stack_bottom;
+}
+
+void GC_Manager::register_current_thread() {
+    register_stack_bottom(detect_current_thread_stack_bottom());
 }
 
 void GC_Manager::unregister_current_thread() {
@@ -199,10 +231,32 @@ std::vector<HeapObjectInfo> GC_Manager::live_objects() const {
             header->payload_offset,
             header->allocation_alignment(),
             header->is_marked(),
+            collect_outgoing_references_locked(block),
         });
     }
 
     return objects;
+}
+
+void GC_Manager::dump_heap(std::ostream& output) const {
+    const GCStats snapshot = stats();
+    const auto objects = live_objects();
+
+    output << "GC heap snapshot: live_objects=" << objects.size()
+           << " live_bytes=" << snapshot.live_bytes
+           << " reserved_bytes=" << snapshot.reserved_bytes
+           << " fragmentation_ratio=" << snapshot.fragmentation_ratio << '\n';
+
+    for (const HeapObjectInfo& object : objects) {
+        output << "object payload=" << object.payload
+               << " payload_size=" << object.payload_size
+               << " reserved_size=" << object.reserved_size
+               << " alignment=" << object.allocation_alignment
+               << " refs=" << object.outgoing_references.size() << '\n';
+        for (void* reference : object.outgoing_references) {
+            output << "  -> " << reference << '\n';
+        }
+    }
 }
 
 bool GC_Manager::is_live(const void* payload) const noexcept {
@@ -468,7 +522,7 @@ GC_Manager::ThreadState& GC_Manager::require_registered_thread_locked(
     ThreadState* state = find_thread_state_locked(thread_id);
     if (state == nullptr || state->stack_bottom == nullptr) {
         throw std::logic_error(
-            "Current thread must call gc::register_stack_bottom() before using GC-Lib on that thread.");
+            "Current thread must call gc::register_current_thread() or gc::register_stack_bottom() before using GC-Lib on that thread.");
     }
     return *state;
 }
@@ -512,6 +566,7 @@ void GC_Manager::cooperate_with_stop_the_world_locked(
     }
 
     state->parked_stack_top = &stack_marker;
+    state->fake_stack_handle = RootScanner::current_fake_stack_handle();
     state->paused_for_collection = true;
     state->register_spill.fill(0U);
     std::memcpy(state->register_spill.data(), &registers, sizeof(registers));
@@ -521,6 +576,7 @@ void GC_Manager::cooperate_with_stop_the_world_locked(
 
     state->paused_for_collection = false;
     state->parked_stack_top = nullptr;
+    state->fake_stack_handle = nullptr;
     state->register_spill.fill(0U);
 }
 
@@ -568,9 +624,34 @@ void GC_Manager::scan_registered_threads_locked(
         RootScanner::scan_range(state.register_spill.data(),
                                 state.register_spill.data() + state.register_spill.size(),
                                 visit_candidate);
-        RootScanner::scan_range(state.parked_stack_top, state.stack_bottom,
-                                visit_candidate);
+        RootScanner::scan_thread_stack(state.parked_stack_top,
+                                       state.stack_bottom,
+                                       state.fake_stack_handle,
+                                       visit_candidate);
     }
+}
+
+std::vector<void*> GC_Manager::collect_outgoing_references_locked(
+    const BlockRecord& block) const {
+    std::vector<void*> references;
+    constexpr std::size_t word_size = sizeof(std::uintptr_t);
+
+    for (std::uintptr_t cur = block.payload_begin;
+         cur + word_size <= block.payload_end;
+         cur += word_size) {
+        const auto candidate = *reinterpret_cast<const std::uintptr_t*>(cur);
+        const BlockRecord* target = find_block_locked(candidate);
+        if (target == nullptr || target == &block) {
+            continue;
+        }
+
+        void* payload = payload_pointer(target->header);
+        if (std::find(references.begin(), references.end(), payload) == references.end()) {
+            references.push_back(payload);
+        }
+    }
+
+    return references;
 }
 
 GC_Manager::BlockRecord* GC_Manager::find_block_locked(
@@ -710,9 +791,6 @@ void GC_Manager::clear_marks_locked() noexcept {
 
 void GC_Manager::mark_candidate_locked(std::uintptr_t candidate,
                                        std::vector<BlockRecord*>& worklist) {
-    if (!is_candidate_aligned(candidate)) {
-        return;
-    }
     BlockRecord* block = find_block_locked(candidate);
     if (block == nullptr) {
         return;
@@ -790,10 +868,6 @@ std::vector<ChunkHeader*> GC_Manager::detach_all_blocks_locked() {
     managed_bytes_ = 0;
     reserved_bytes_ = 0;
     return order_blocks_for_finalization_locked(blocks);
-}
-
-bool GC_Manager::is_candidate_aligned(std::uintptr_t candidate) noexcept {
-    return candidate % alignof(ChunkHeader) == 0U;
 }
 
 void GC_Manager::destroy_blocks(const std::vector<ChunkHeader*>& blocks) noexcept {

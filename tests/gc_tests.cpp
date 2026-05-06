@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -83,6 +84,12 @@ struct LargeBlob {
     ~LargeBlob() { ++destroyed; }
 };
 
+struct ByteBlob {
+    static inline int destroyed = 0;
+    std::array<std::byte, 32> payload{};
+    ~ByteBlob() { ++destroyed; }
+};
+
 struct alignas(64) OverAlignedBlob {
     static inline int destroyed = 0;
     std::array<std::byte, 64> payload{};
@@ -122,6 +129,7 @@ void reset_counts() {
     Node::destroyed = 0;
     Buffer::destroyed = 0;
     LargeBlob::destroyed = 0;
+    ByteBlob::destroyed = 0;
     OverAlignedBlob::destroyed = 0;
     ReentrantNode::ran = false;
     FinalizerDependencyNode::dependency_destroyed_too_early = false;
@@ -242,6 +250,36 @@ void test_interior_pointer() {
            "object should be reclaimed once the interior pointer disappears");
 }
 
+GC_NOINLINE void store_unaligned_interior_pointer(std::uintptr_t* storage) {
+    auto blob = gc::gc_new<ByteBlob>();
+    *storage = reinterpret_cast<std::uintptr_t>(&blob->payload[1]);
+    blob.reset();
+}
+
+void test_unaligned_interior_pointer() {
+    reset_gc();
+
+    auto interior = std::make_unique<std::uintptr_t>(0U);
+    store_unaligned_interior_pointer(interior.get());
+    scrub_stack();
+
+    auto& manager = gc::GC_Manager::instance();
+    manager.register_root_object(interior.get());
+    manager.collect();
+
+    expect(*interior != 0U,
+           "unaligned interior pointer should remain visible in the registered root range");
+    expect(manager.managed_block_count() == 1U,
+           "unaligned interior pointer should keep the parent block alive");
+
+    manager.unregister_root_object(interior.get());
+    *interior = 0U;
+    collect_until_stable();
+
+    expect(manager.managed_block_count() == 0U,
+           "object should be reclaimed once the unaligned interior pointer disappears");
+}
+
 GC_NOINLINE void make_unreachable_blob() {
     auto blob = gc::gc_new<LargeBlob>();
     (void)blob;
@@ -295,6 +333,20 @@ void test_registered_external_root_range() {
            "object should be reclaimed after unregistering the external root range");
 }
 
+void test_gc_root_exact_rooting() {
+    reset_gc();
+
+    gc::gc_root<Node> root(gc::gc_new<Node>(10));
+    root->next = gc::gc_new<Node>(20);
+
+    gc::GC_Manager::instance().collect();
+    expect(gc::GC_Manager::instance().managed_block_count() == 2U,
+           "gc_root should keep its contained object graph alive across collection");
+
+    root.reset();
+    gc::GC_Manager::instance().shutdown();
+}
+
 void test_unregistered_cross_thread_use_is_rejected() {
     reset_gc();
 
@@ -333,9 +385,8 @@ void test_registered_cross_thread_use_is_supported() {
     std::exception_ptr worker_error;
 
     std::thread worker([&]() {
-        int worker_anchor = 0;
         try {
-            gc::ScopedThreadRegistration registration(&worker_anchor);
+            gc::ScopedThreadRegistration registration;
             auto rooted = gc::gc_new<Node>(77);
 
             published.store(reinterpret_cast<std::uintptr_t>(rooted.get()),
@@ -447,6 +498,33 @@ void test_gc_new_array_zero_count() {
     expect(!arr, "gc_new_array(0) should return null");
     expect(gc::GC_Manager::instance().managed_block_count() == 0U,
            "zero-count array should not allocate a block");
+}
+
+void test_gc_new_array_nothrow() {
+    reset_gc();
+
+    auto arr = gc::gc_new_array_nothrow<Buffer>(3U);
+    expect(static_cast<bool>(arr), "gc_new_array_nothrow should succeed under normal conditions");
+    arr[1].values[2] = 17;
+    expect(arr[1].values[2] == 17, "gc_new_array_nothrow should return a usable array");
+
+    arr.reset();
+    gc::GC_Manager::instance().shutdown();
+}
+
+void test_gc_new_array_over_aligned_elements() {
+    reset_gc();
+
+    auto arr = gc::gc_new_array<OverAlignedBlob>(2U);
+    expect(static_cast<bool>(arr), "gc_new_array should allocate over-aligned arrays");
+    expect(reinterpret_cast<std::uintptr_t>(arr.get()) % alignof(OverAlignedBlob) == 0U,
+           "gc_new_array should preserve element alignment for over-aligned types");
+
+    arr.reset();
+    gc::GC_Manager::instance().shutdown();
+
+    expect(OverAlignedBlob::destroyed >= 2,
+           "over-aligned array elements should be destructed during shutdown");
 }
 
 GC_NOINLINE void setup_weak_basic(gc::gc_weak_ptr<Node>& out) {
@@ -569,6 +647,32 @@ void test_gc_ptr_stl_compatibility() {
     collect_until_stable();
 }
 
+void test_gc_ptr_array_stl_compatibility() {
+    reset_gc();
+
+    auto a = gc::gc_new_array<Buffer>(2U);
+    auto b = gc::gc_new_array<Buffer>(3U);
+
+    std::unordered_set<gc::gc_ptr<Buffer[]>> uset;
+    uset.insert(a);
+    uset.insert(b);
+    expect(uset.size() == 2U, "gc_ptr<T[]> should work in unordered_set");
+
+    std::map<gc::gc_ptr<Buffer[]>, int> omap;
+    omap[a] = 1;
+    omap[b] = 2;
+    expect(omap.size() == 2U, "gc_ptr<T[]> should work as ordered map keys");
+
+    gc::gc_ptr<Buffer[]> original = a;
+    gc::swap(a, b);
+    expect(a.get() == original.get() || b.get() == original.get(),
+           "swap should exchange gc_ptr<T[]> handles");
+
+    a.reset();
+    b.reset();
+    gc::GC_Manager::instance().shutdown();
+}
+
 void test_gc_ptr_casts() {
     reset_gc();
 
@@ -615,57 +719,90 @@ void test_gc_stats() {
     expect(after.bytes_reclaimed_total > 0U, "bytes_reclaimed_total should be non-zero");
 }
 
-    void test_heap_snapshot_and_fragmentation_stats() {
-        reset_gc();
+void test_heap_dump_includes_object_graph() {
+    reset_gc();
 
-        auto object = gc::gc_new<OverAlignedBlob>();
-        auto& manager = gc::GC_Manager::instance();
+    auto root = gc::gc_new<Node>(11);
+    root->next = gc::gc_new<Node>(22);
 
-        const auto snapshot = manager.live_objects();
-        expect(snapshot.size() == 1U, "heap snapshot should report one live object");
-        expect(snapshot[0].payload == object.get(),
-            "heap snapshot should report the live payload address");
-        expect(snapshot[0].payload_size == sizeof(OverAlignedBlob),
-            "heap snapshot should report the payload size");
-        expect(snapshot[0].reserved_size >= snapshot[0].payload_size,
-            "reserved bytes should include at least the payload size");
-
-        const auto stats = manager.stats();
-        expect(stats.live_blocks == 1U, "stats should report one live block");
-        expect(stats.live_bytes == sizeof(OverAlignedBlob),
-            "stats should report the live payload bytes");
-        expect(stats.reserved_bytes >= stats.live_bytes,
-            "reserved bytes should be at least the live payload bytes");
-        expect(stats.fragmentation_ratio >= 0.0 && stats.fragmentation_ratio < 1.0,
-            "fragmentation ratio should be normalized to [0, 1)");
-
-        object.reset();
-        manager.shutdown();
-
-        expect(manager.live_objects().empty(), "heap snapshot should be empty after shutdown");
-    }
-
-    void test_dependency_aware_shutdown_finalization() {
-        reset_gc();
-
-        {
-         auto dependent = gc::gc_new<FinalizerDependencyNode>(0);
-         auto dependency = gc::gc_new<FinalizerDependencyNode>(1);
-         dependent->dependency = dependency;
-
-         // Drop the handles in an order that used to be unsafe under pure address-order
-         // destruction: the dependent was allocated first and points at a later block.
-         dependency.reset();
-         dependent.reset();
+    auto snapshot = gc::GC_Manager::instance().live_objects();
+    bool found_edge = false;
+    for (const auto& object : snapshot) {
+        if (object.payload == root.get()) {
+            found_edge = std::find(object.outgoing_references.begin(),
+                                   object.outgoing_references.end(),
+                                   static_cast<void*>(root->next.get())) !=
+                         object.outgoing_references.end();
         }
-
-        gc::GC_Manager::instance().shutdown();
-
-        expect(!FinalizerDependencyNode::dependency_destroyed_too_early,
-            "dependents should be finalized before the objects they reference");
-        expect(FinalizerDependencyNode::destroyed[0] && FinalizerDependencyNode::destroyed[1],
-            "shutdown should destroy both dependency-ordered objects");
     }
+    expect(found_edge, "heap snapshot should include outgoing object references");
+
+    std::ostringstream dump;
+    gc::GC_Manager::instance().dump_heap(dump);
+
+    expect(dump.str().find("GC heap snapshot: live_objects=2") != std::string::npos,
+           "heap dump should include the live object count");
+
+    std::ostringstream child_ptr;
+    child_ptr << static_cast<void*>(root->next.get());
+    expect(dump.str().find(child_ptr.str()) != std::string::npos,
+           "heap dump should include referenced object addresses");
+
+    root.reset();
+    gc::GC_Manager::instance().shutdown();
+}
+
+void test_heap_snapshot_and_fragmentation_stats() {
+    reset_gc();
+
+    auto object = gc::gc_new<OverAlignedBlob>();
+    auto& manager = gc::GC_Manager::instance();
+
+    const auto snapshot = manager.live_objects();
+    expect(snapshot.size() == 1U, "heap snapshot should report one live object");
+    expect(snapshot[0].payload == object.get(),
+           "heap snapshot should report the live payload address");
+    expect(snapshot[0].payload_size == sizeof(OverAlignedBlob),
+           "heap snapshot should report the payload size");
+    expect(snapshot[0].reserved_size >= snapshot[0].payload_size,
+           "reserved bytes should include at least the payload size");
+
+    const auto stats = manager.stats();
+    expect(stats.live_blocks == 1U, "stats should report one live block");
+    expect(stats.live_bytes == sizeof(OverAlignedBlob),
+           "stats should report the live payload bytes");
+    expect(stats.reserved_bytes >= stats.live_bytes,
+           "reserved bytes should be at least the live payload bytes");
+    expect(stats.fragmentation_ratio >= 0.0 && stats.fragmentation_ratio < 1.0,
+           "fragmentation ratio should be normalized to [0, 1)");
+
+    object.reset();
+    manager.shutdown();
+
+    expect(manager.live_objects().empty(), "heap snapshot should be empty after shutdown");
+}
+
+void test_dependency_aware_shutdown_finalization() {
+    reset_gc();
+
+    {
+        auto dependent = gc::gc_new<FinalizerDependencyNode>(0);
+        auto dependency = gc::gc_new<FinalizerDependencyNode>(1);
+        dependent->dependency = dependency;
+
+        // Drop the handles in an order that used to be unsafe under pure address-order
+        // destruction: the dependent was allocated first and points at a later block.
+        dependency.reset();
+        dependent.reset();
+    }
+
+    gc::GC_Manager::instance().shutdown();
+
+    expect(!FinalizerDependencyNode::dependency_destroyed_too_early,
+           "dependents should be finalized before the objects they reference");
+    expect(FinalizerDependencyNode::destroyed[0] && FinalizerDependencyNode::destroyed[1],
+           "shutdown should destroy both dependency-ordered objects");
+}
 
 void test_release_unconstructed_unknown_pointer() {
     reset_gc();
@@ -690,9 +827,11 @@ int run_all_tests() {
         {"reachable chain",                 test_reachable_chain},
         {"deep reachable chain",            test_deep_reachable_chain},
         {"interior pointer",                test_interior_pointer},
+        {"unaligned interior pointer",      test_unaligned_interior_pointer},
         {"threshold trigger",               test_threshold_trigger},
         {"over-aligned allocation",         test_over_aligned_allocation},
         {"registered external root range",  test_registered_external_root_range},
+        {"gc_root exact rooting",           test_gc_root_exact_rooting},
         {"unregistered cross-thread use is rejected",
                             test_unregistered_cross_thread_use_is_rejected},
         {"registered cross-thread use is supported",
@@ -702,13 +841,18 @@ int run_all_tests() {
         {"gc_new_nothrow",                  test_gc_new_nothrow},
         {"gc_new_array basic",              test_gc_new_array_basic},
         {"gc_new_array zero count",         test_gc_new_array_zero_count},
+        {"gc_new_array nothrow",            test_gc_new_array_nothrow},
+        {"gc_new_array over-aligned elements",
+                            test_gc_new_array_over_aligned_elements},
         {"gc_weak_ptr basic",               test_gc_weak_ptr_basic},
         {"gc_weak_ptr copy",                test_gc_weak_ptr_copy},
         {"gc_weak_ptr move",                test_gc_weak_ptr_move},
         {"gc_weak_ptr reset",               test_gc_weak_ptr_reset},
         {"gc_ptr STL compatibility",        test_gc_ptr_stl_compatibility},
+        {"gc_ptr array STL compatibility",  test_gc_ptr_array_stl_compatibility},
         {"gc_ptr casts",                    test_gc_ptr_casts},
         {"GC stats",                        test_gc_stats},
+        {"heap dump includes object graph", test_heap_dump_includes_object_graph},
         {"heap snapshot and fragmentation stats",
                                             test_heap_snapshot_and_fragmentation_stats},
         {"dependency-aware shutdown finalization",
@@ -736,6 +880,7 @@ int run_all_tests() {
 
 int main(int argc, char** argv) {
     (void)argv;
-    gc::register_stack_bottom(&argc);
+    (void)argc;
+    gc::register_current_thread();
     return run_all_tests();
 }

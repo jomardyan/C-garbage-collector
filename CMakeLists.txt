@@ -14,6 +14,23 @@ enable_testing()
 option(GC_ENABLE_ASAN  "Build with AddressSanitizer + UBSan"  OFF)
 option(GC_ENABLE_TSAN  "Build with ThreadSanitizer"           OFF)
 
+function(gc_enable_sanitizers target sanitize_sources)
+    if(GC_ENABLE_ASAN)
+        if(${sanitize_sources})
+            target_compile_options(${target} PRIVATE
+                -fsanitize=address,undefined
+                -fno-omit-frame-pointer
+                -fno-sanitize-address-use-after-scope)
+        endif()
+        target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+    elseif(GC_ENABLE_TSAN)
+        if(${sanitize_sources})
+            target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+        endif()
+        target_link_options(${target} PRIVATE -fsanitize=thread)
+    endif()
+endfunction()
+
 # ---- Library ----------------------------------------------------------------
 add_library(gc_lib
     src/GCManager.cpp
@@ -34,14 +51,9 @@ if(MSVC)
     target_compile_options(gc_lib PRIVATE /W4 /permissive-)
 else()
     target_compile_options(gc_lib PRIVATE -Wall -Wextra -Wpedantic)
-    if(GC_ENABLE_ASAN)
-        target_compile_options(gc_lib PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
-        target_link_options(gc_lib PUBLIC -fsanitize=address,undefined)
-    elseif(GC_ENABLE_TSAN)
-        target_compile_options(gc_lib PUBLIC -fsanitize=thread -fno-omit-frame-pointer)
-        target_link_options(gc_lib PUBLIC -fsanitize=thread)
-    endif()
 endif()
+
+gc_enable_sanitizers(gc_lib TRUE)
 
 # ---- Demo executable --------------------------------------------------------
 add_executable(gc_demo src/main.cpp)
@@ -52,6 +64,8 @@ else()
     target_compile_options(gc_demo PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+gc_enable_sanitizers(gc_demo FALSE)
+
 # ---- Tests ------------------------------------------------------------------
 add_executable(gc_tests tests/gc_tests.cpp)
 target_link_libraries(gc_tests PRIVATE gc_lib)
@@ -61,7 +75,13 @@ else()
     target_compile_options(gc_tests PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+gc_enable_sanitizers(gc_tests FALSE)
+
 add_test(NAME gc_tests COMMAND gc_tests)
+if(GC_ENABLE_ASAN)
+    set_tests_properties(gc_tests PROPERTIES
+        ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=0")
+endif()
 
 # ---- Install / export -------------------------------------------------------
 install(TARGETS gc_lib

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <iosfwd>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -39,6 +40,7 @@ struct HeapObjectInfo {
     std::size_t payload_offset = 0;
     std::size_t allocation_alignment = 0;
     bool marked = false;
+    std::vector<void*> outgoing_references;
 };
 
 /// Global conservative mark-and-sweep collector.
@@ -52,6 +54,9 @@ public:
     /// Registers the approximate stack bottom for the current thread.
     /// Each mutator thread should call this before allocating or collecting.
     void register_stack_bottom(const void* stack_bottom);
+
+    /// Detects the current thread's stack bounds and registers them automatically.
+    void register_current_thread();
 
     /// Removes the current thread from the collector's registered thread set.
     void unregister_current_thread();
@@ -82,6 +87,9 @@ public:
 
     /// Returns a debug snapshot of every live object currently managed by the GC.
     std::vector<HeapObjectInfo> live_objects() const;
+
+    /// Writes a human-readable heap snapshot including outgoing references.
+    void dump_heap(std::ostream& output) const;
 
     /// Returns true if the given payload pointer belongs to a live GC block.
     bool is_live(const void* payload) const noexcept;
@@ -152,6 +160,7 @@ private:
     struct ThreadState {
         const void* stack_bottom = nullptr;
         const void* parked_stack_top = nullptr;
+        void* fake_stack_handle = nullptr;
         std::array<std::uintptr_t, kRegisterSpillWordCount> register_spill{};
         bool paused_for_collection = false;
     };
@@ -171,6 +180,7 @@ private:
     void release_stop_the_world();
     void scan_registered_threads_locked(std::thread::id collector_thread,
                                         std::vector<BlockRecord*>& worklist);
+    std::vector<void*> collect_outgoing_references_locked(const BlockRecord& block) const;
     void clear_marks_locked() noexcept;
     std::vector<ChunkHeader*> order_blocks_for_finalization_locked(
         const std::vector<BlockRecord>& blocks) const;
@@ -184,8 +194,6 @@ private:
     std::vector<ChunkHeader*> detach_all_blocks_locked();
     void invalidate_weak_refs_for_block_locked(std::uintptr_t payload_begin,
                                                std::uintptr_t payload_end) noexcept;
-
-    static bool is_candidate_aligned(std::uintptr_t candidate) noexcept;
     static void destroy_blocks(const std::vector<ChunkHeader*>& blocks) noexcept;
 
     mutable std::mutex mutex_;
@@ -207,6 +215,10 @@ private:
 /// RAII helper for registering and unregistering a mutator thread.
 class ScopedThreadRegistration {
 public:
+    ScopedThreadRegistration() {
+        GC_Manager::instance().register_current_thread();
+    }
+
     explicit ScopedThreadRegistration(const void* stack_bottom) {
         GC_Manager::instance().register_stack_bottom(stack_bottom);
     }
@@ -221,6 +233,10 @@ public:
 
 inline void register_stack_bottom(const void* stack_bottom) {
     GC_Manager::instance().register_stack_bottom(stack_bottom);
+}
+
+inline void register_current_thread() {
+    GC_Manager::instance().register_current_thread();
 }
 
 inline void unregister_current_thread() {

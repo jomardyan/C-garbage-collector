@@ -5,6 +5,20 @@
 #include <cstdint>
 #include <cstring>
 
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define GC_HAS_ASAN 1
+#endif
+#endif
+
+#if defined(__SANITIZE_ADDRESS__)
+#define GC_HAS_ASAN 1
+#endif
+
+#if defined(GC_HAS_ASAN)
+#include <sanitizer/asan_interface.h>
+#endif
+
 #if defined(__linux__)
 #include <fstream>
 #include <sstream>
@@ -42,53 +56,22 @@ void scan_words(const void* begin,
     start = (start + word_size - 1U) & ~(word_size - 1U);
 
     for (std::uintptr_t cur = start; cur + word_size <= finish; cur += word_size) {
-        visitor(*reinterpret_cast<const std::uintptr_t*>(cur));
+        const void* word_address = reinterpret_cast<const void*>(cur);
+#if defined(GC_HAS_ASAN)
+    if (__asan_region_is_poisoned(const_cast<void*>(word_address), word_size) != nullptr) {
+            continue;
+        }
+#endif
+
+        std::uintptr_t candidate = 0U;
+        std::memcpy(&candidate, word_address, sizeof(candidate));
+        visitor(candidate);
     }
 }
 
 // setjmp flushes caller-saved registers into the jmp_buf on most ABIs (x86-64,
 // AArch64, RISC-V).  On some ABIs a register window may be missed; the
 // conservative stack scan below provides a second line of defence.
-void clear_transient_registers() noexcept {
-#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
-    __asm__ __volatile__(
-        "xor %%rax, %%rax\n\t"
-        "xor %%rcx, %%rcx\n\t"
-        "xor %%rdx, %%rdx\n\t"
-        "xor %%rsi, %%rsi\n\t"
-        "xor %%r8, %%r8\n\t"
-        "xor %%r9, %%r9\n\t"
-        "xor %%r10, %%r10\n\t"
-        "xor %%r11, %%r11\n\t"
-        :
-        :
-        : "rax", "rcx", "rdx", "rsi", "r8", "r9", "r10", "r11", "memory");
-#elif (defined(__GNUC__) || defined(__clang__)) && defined(__aarch64__)
-    __asm__ __volatile__(
-        "mov x1, xzr\n\t"
-        "mov x2, xzr\n\t"
-        "mov x3, xzr\n\t"
-        "mov x4, xzr\n\t"
-        "mov x5, xzr\n\t"
-        "mov x6, xzr\n\t"
-        "mov x7, xzr\n\t"
-        "mov x8, xzr\n\t"
-        "mov x9, xzr\n\t"
-        "mov x10, xzr\n\t"
-        "mov x11, xzr\n\t"
-        "mov x12, xzr\n\t"
-        "mov x13, xzr\n\t"
-        "mov x14, xzr\n\t"
-        "mov x15, xzr\n\t"
-        "mov x16, xzr\n\t"
-        "mov x17, xzr\n\t"
-        :
-        :
-        : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
-          "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-#endif
-}
-
 GC_NOINLINE void scan_registers_frame(
     const RootScanner::CandidateVisitor& visitor,
     std::uintptr_t zero0,
@@ -108,8 +91,6 @@ GC_NOINLINE void scan_registers_frame(
     (void)zero6;
     (void)zero7;
 
-    clear_transient_registers();
-
     std::jmp_buf registers;
     std::memset(&registers, 0, sizeof(registers));
     if (setjmp(registers) == 0) {
@@ -123,19 +104,27 @@ void scan_registers(const RootScanner::CandidateVisitor& visitor) {
     scan_registers_frame(visitor, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U);
 }
 
-void scan_stack(const void* stack_bottom,
-                const RootScanner::CandidateVisitor& visitor) {
-    if (stack_bottom == nullptr) {
+void scan_stack_range(const void* stack_top,
+                      const void* stack_bottom,
+                      void* fake_stack_handle,
+                      const RootScanner::CandidateVisitor& visitor) {
+    if (stack_top == nullptr || stack_bottom == nullptr) {
         return;
     }
 
-    std::uintptr_t local_marker = 0;
-    const void* stack_top = &local_marker;
-
-#if defined(__GNUC__) || defined(__clang__)
-    if (void* frame = __builtin_frame_address(0)) {
-        stack_top = frame;
+#if defined(GC_HAS_ASAN)
+    if (fake_stack_handle != nullptr) {
+        void* fake_frame_begin = nullptr;
+        void* fake_frame_end = nullptr;
+        if (void* real_stack_top = __asan_addr_is_in_fake_stack(
+                fake_stack_handle, const_cast<void*>(stack_top),
+                &fake_frame_begin, &fake_frame_end)) {
+            scan_words(fake_frame_begin, fake_frame_end, visitor);
+            stack_top = real_stack_top;
+        }
     }
+#else
+    (void)fake_stack_handle;
 #endif
 
     scan_words(stack_top, stack_bottom, visitor);
@@ -144,6 +133,8 @@ void scan_stack(const void* stack_bottom,
 // ---- Platform-specific global/data-segment scanning -------------------------
 
 #if defined(__linux__)
+
+#if !defined(GC_HAS_ASAN)
 
 namespace {
 
@@ -175,7 +166,17 @@ bool should_scan_linux_mapping(const std::string& permissions,
 
 }  // namespace
 
+#endif
+
 void scan_globals(const RootScanner::CandidateVisitor& visitor) {
+#if defined(GC_HAS_ASAN)
+    (void)visitor;
+    // ASan injects poisoned redzones and bookkeeping into writable module
+    // mappings. Scanning those mappings causes invalid reads and pervasive
+    // false positives that pin the managed heap, so sanitizer builds fall back
+    // to stack scanning plus explicit root registration.
+    return;
+#else
     std::ifstream maps("/proc/self/maps");
     if (!maps.is_open()) {
         return;
@@ -218,6 +219,7 @@ void scan_globals(const RootScanner::CandidateVisitor& visitor) {
                    reinterpret_cast<const void*>(end),
                    visitor);
     }
+#endif
 }
 
 #elif defined(__APPLE__)
@@ -316,16 +318,33 @@ void scan_globals(const RootScanner::CandidateVisitor& /*visitor*/) {
 
 }  // namespace
 
+void* RootScanner::current_fake_stack_handle() noexcept {
+#if defined(GC_HAS_ASAN)
+    return __asan_get_current_fake_stack();
+#else
+    return nullptr;
+#endif
+}
+
 void RootScanner::scan_range(const void* begin,
                              const void* end,
                              const CandidateVisitor& visitor) {
     scan_words(begin, end, visitor);
 }
 
+void RootScanner::scan_thread_stack(const void* stack_top,
+                                    const void* stack_bottom,
+                                    void* fake_stack_handle,
+                                    const CandidateVisitor& visitor) {
+    scan_stack_range(stack_top, stack_bottom, fake_stack_handle, visitor);
+}
+
 void RootScanner::scan(const void* stack_bottom,
                        const CandidateVisitor& visitor) {
+    std::uintptr_t local_marker = 0;
+
     scan_registers(visitor);
-    scan_stack(stack_bottom, visitor);
+    scan_stack_range(&local_marker, stack_bottom, current_fake_stack_handle(), visitor);
     scan_globals(visitor);
 }
 

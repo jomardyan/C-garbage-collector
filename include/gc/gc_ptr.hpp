@@ -103,6 +103,13 @@ constexpr void swap(gc_ptr<T>& lhs, gc_ptr<T>& rhs) noexcept {
     rhs.reset(tmp);
 }
 
+template <typename T>
+constexpr void swap(gc_ptr<T[]>& lhs, gc_ptr<T[]>& rhs) noexcept {
+    T* tmp = lhs.get();
+    lhs.reset(rhs.get());
+    rhs.reset(tmp);
+}
+
 /// Casts a gc_ptr using static_cast semantics.
 template <typename To, typename From>
 gc_ptr<To> static_gc_ptr_cast(const gc_ptr<From>& p) noexcept {
@@ -129,6 +136,13 @@ namespace std {
 template <typename T>
 struct hash<gc::gc_ptr<T>> {
     std::size_t operator()(const gc::gc_ptr<T>& p) const noexcept {
+        return std::hash<T*>{}(p.get());
+    }
+};
+
+template <typename T>
+struct hash<gc::gc_ptr<T[]>> {
+    std::size_t operator()(const gc::gc_ptr<T[]>& p) const noexcept {
         return std::hash<T*>{}(p.get());
     }
 };
