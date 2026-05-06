@@ -333,6 +333,30 @@ void test_registered_external_root_range() {
            "object should be reclaimed after unregistering the external root range");
 }
 
+    void test_scoped_external_root_object() {
+        reset_gc();
+
+        auto external_root = std::make_unique<gc::gc_ptr<Node>>();
+        *external_root = gc::gc_new<Node>(123);
+
+        {
+         gc::ScopedRootObject<gc::gc_ptr<Node>> rooted_external(external_root.get());
+         gc::GC_Manager::instance().collect();
+
+         expect(gc::GC_Manager::instance().managed_block_count() == 1U,
+             "ScopedRootObject should keep a heap-hosted gc_ptr alive while in scope");
+         expect(static_cast<bool>(*external_root),
+             "external root should still point at the live object while registered");
+        }
+
+        external_root->reset();
+        scrub_stack();
+        collect_until_stable();
+
+        expect(gc::GC_Manager::instance().managed_block_count() == 0U,
+            "ScopedRootObject should unregister automatically on scope exit");
+    }
+
 void test_gc_root_exact_rooting() {
     reset_gc();
 
@@ -605,6 +629,33 @@ void test_gc_weak_ptr_reset() {
     collect_until_stable();
 }
 
+GC_NOINLINE void setup_weak_array_basic(gc::gc_weak_ptr<Buffer[]>& out) {
+    auto array = gc::gc_new_array<Buffer>(2U);
+    array[1].values[0] = 17;
+    out = gc::gc_weak_ptr<Buffer[]>(array);
+}
+
+void test_gc_weak_ptr_array_basic() {
+    reset_gc();
+
+    gc::gc_weak_ptr<Buffer[]> weak;
+    setup_weak_array_basic(weak);
+
+    expect(!weak.expired(), "array weak ptr should not expire while the array is live");
+
+    auto locked = weak.lock();
+    expect(static_cast<bool>(locked), "lock() should return a live array handle");
+    expect(locked[1].values[0] == 17,
+           "locked array weak ptr should preserve access to the managed array");
+    locked.reset();
+
+    gc::GC_Manager::instance().shutdown();
+
+    expect(weak.expired(), "array weak ptr should expire after shutdown reclaims the array");
+    auto dead = weak.lock();
+    expect(!static_cast<bool>(dead), "lock() on an expired array weak ptr should return null");
+}
+
 void test_gc_ptr_stl_compatibility() {
     reset_gc();
 
@@ -831,6 +882,7 @@ int run_all_tests() {
         {"threshold trigger",               test_threshold_trigger},
         {"over-aligned allocation",         test_over_aligned_allocation},
         {"registered external root range",  test_registered_external_root_range},
+        {"scoped external root object",     test_scoped_external_root_object},
         {"gc_root exact rooting",           test_gc_root_exact_rooting},
         {"unregistered cross-thread use is rejected",
                             test_unregistered_cross_thread_use_is_rejected},
@@ -848,6 +900,7 @@ int run_all_tests() {
         {"gc_weak_ptr copy",                test_gc_weak_ptr_copy},
         {"gc_weak_ptr move",                test_gc_weak_ptr_move},
         {"gc_weak_ptr reset",               test_gc_weak_ptr_reset},
+        {"gc_weak_ptr array basic",         test_gc_weak_ptr_array_basic},
         {"gc_ptr STL compatibility",        test_gc_ptr_stl_compatibility},
         {"gc_ptr array STL compatibility",  test_gc_ptr_array_stl_compatibility},
         {"gc_ptr casts",                    test_gc_ptr_casts},

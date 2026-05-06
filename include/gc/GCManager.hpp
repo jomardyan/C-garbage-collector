@@ -231,6 +231,117 @@ public:
     ScopedThreadRegistration& operator=(const ScopedThreadRegistration&) = delete;
 };
 
+/// RAII helper for registering and unregistering an explicit root memory range.
+class ScopedRootRange {
+public:
+    ScopedRootRange() noexcept = default;
+
+    ScopedRootRange(const void* begin, const void* end) {
+        reset(begin, end);
+    }
+
+    ~ScopedRootRange() {
+        reset();
+    }
+
+    ScopedRootRange(const ScopedRootRange&) = delete;
+    ScopedRootRange& operator=(const ScopedRootRange&) = delete;
+
+    ScopedRootRange(ScopedRootRange&& other) noexcept
+        : begin_(other.begin_), end_(other.end_), registered_(other.registered_) {
+        other.begin_ = nullptr;
+        other.end_ = nullptr;
+        other.registered_ = false;
+    }
+
+    ScopedRootRange& operator=(ScopedRootRange&& other) noexcept {
+        if (this != &other) {
+            reset();
+            begin_ = other.begin_;
+            end_ = other.end_;
+            registered_ = other.registered_;
+            other.begin_ = nullptr;
+            other.end_ = nullptr;
+            other.registered_ = false;
+        }
+        return *this;
+    }
+
+    void reset(const void* begin = nullptr, const void* end = nullptr) {
+        if (registered_) {
+            GC_Manager::instance().unregister_root_range(begin_, end_);
+        }
+
+        begin_ = begin;
+        end_ = end;
+        registered_ = begin_ != nullptr && end_ != nullptr && begin_ != end_;
+
+        if (registered_) {
+            GC_Manager::instance().register_root_range(begin_, end_);
+        }
+    }
+
+    const void* begin() const noexcept { return begin_; }
+    const void* end() const noexcept { return end_; }
+    explicit operator bool() const noexcept { return registered_; }
+
+private:
+    const void* begin_ = nullptr;
+    const void* end_ = nullptr;
+    bool registered_ = false;
+};
+
+/// RAII helper for registering and unregistering an explicit root object.
+template <typename T>
+class ScopedRootObject {
+    static_assert(!std::is_void_v<T>, "ScopedRootObject<void> is not supported.");
+
+public:
+    ScopedRootObject() noexcept = default;
+
+    explicit ScopedRootObject(const T* object) {
+        reset(object);
+    }
+
+    ~ScopedRootObject() {
+        reset();
+    }
+
+    ScopedRootObject(const ScopedRootObject&) = delete;
+    ScopedRootObject& operator=(const ScopedRootObject&) = delete;
+
+    ScopedRootObject(ScopedRootObject&& other) noexcept : object_(other.object_) {
+        other.object_ = nullptr;
+    }
+
+    ScopedRootObject& operator=(ScopedRootObject&& other) noexcept {
+        if (this != &other) {
+            reset();
+            object_ = other.object_;
+            other.object_ = nullptr;
+        }
+        return *this;
+    }
+
+    void reset(const T* object = nullptr) {
+        if (object_ != nullptr) {
+            GC_Manager::instance().unregister_root_object(object_);
+        }
+
+        object_ = object;
+
+        if (object_ != nullptr) {
+            GC_Manager::instance().register_root_object(object_);
+        }
+    }
+
+    const T* get() const noexcept { return object_; }
+    explicit operator bool() const noexcept { return object_ != nullptr; }
+
+private:
+    const T* object_ = nullptr;
+};
+
 inline void register_stack_bottom(const void* stack_bottom) {
     GC_Manager::instance().register_stack_bottom(stack_bottom);
 }

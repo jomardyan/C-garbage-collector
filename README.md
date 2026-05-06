@@ -4,6 +4,8 @@
 
 It is substantially more capable than the original demo collector. It now provides automatic thread registration helpers, weak-pointer invalidation, array allocation, heap inspection APIs, dependency-aware finalization ordering, and cross-platform global scanning on Linux, macOS, and Windows.
 
+Because the collector is conservative, ambiguous stack or global words can delay reclamation. Weak handles are cleared when their targets are actually reclaimed, but false-positive roots can defer that reclamation.
+
 ## Features
 
 - Conservative mark-and-sweep collection with iterative marking.
@@ -12,7 +14,7 @@ It is substantially more capable than the original demo collector. It now provid
 - Automatic threshold-triggered collection via `collect_if_needed()`.
 - `gc_ptr<T>` strong handles with STL ordering/hash support.
 - `gc_root<T>` exact RAII roots for optimization-robust local rooting.
-- `gc_weak_ptr<T>` weak handles that are nulled during sweep/shutdown.
+- `gc_weak_ptr<T>` and `gc_weak_ptr<T[]>` weak handles that are nulled during sweep/shutdown.
 - `gc_new<T>()`, `gc_new_nothrow<T>()`, `gc_new_array<T>()`, and `gc_new_array_nothrow<T>()`.
 - Over-aligned allocation support.
 - Cooperative multi-thread stop-the-world collection using per-thread registration and safepoints.
@@ -82,6 +84,16 @@ auto external_root = std::make_unique<gc::gc_ptr<MyNode>>();
 gc::GC_Manager::instance().register_root_object(external_root.get());
 gc::collect();
 gc::GC_Manager::instance().unregister_root_object(external_root.get());
+```
+
+For production code, prefer the RAII helpers so explicit roots cannot be leaked accidentally:
+
+```cpp
+auto external_root = std::make_unique<gc::gc_ptr<MyNode>>();
+*external_root = gc::gc_new<MyNode>();
+
+gc::ScopedRootObject<gc::gc_ptr<MyNode>> rooted_external(external_root.get());
+gc::collect();
 ```
 
 ## Debugging and Introspection
