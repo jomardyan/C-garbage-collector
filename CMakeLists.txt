@@ -83,6 +83,13 @@ if(GC_ENABLE_ASAN)
         ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=0")
 endif()
 
+# ---- Examples ---------------------------------------------------------------
+option(GC_BUILD_EXAMPLES "Build example programs" ON)
+
+if(GC_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
+
 # ---- Install / export -------------------------------------------------------
 install(TARGETS gc_lib
     EXPORT GCLibTargets

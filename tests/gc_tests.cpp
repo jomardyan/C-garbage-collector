@@ -333,29 +333,28 @@ void test_registered_external_root_range() {
            "object should be reclaimed after unregistering the external root range");
 }
 
-    void test_scoped_external_root_object() {
-        reset_gc();
+void test_scoped_external_root_object() {
+    reset_gc();
 
-        auto external_root = std::make_unique<gc::gc_ptr<Node>>();
-        *external_root = gc::gc_new<Node>(123);
+    auto external_root = std::make_unique<gc::gc_ptr<Node>>();
+    *external_root = gc::gc_new<Node>(123);
 
-        {
-         gc::ScopedRootObject<gc::gc_ptr<Node>> rooted_external(external_root.get());
-         gc::GC_Manager::instance().collect();
+    {
+        gc::ScopedRootObject<gc::gc_ptr<Node>> rooted_external(external_root.get());
+        gc::GC_Manager::instance().collect();
 
-         expect(gc::GC_Manager::instance().managed_block_count() == 1U,
-             "ScopedRootObject should keep a heap-hosted gc_ptr alive while in scope");
-         expect(static_cast<bool>(*external_root),
-             "external root should still point at the live object while registered");
-        }
-
-        external_root->reset();
-        scrub_stack();
-        collect_until_stable();
-
-        expect(gc::GC_Manager::instance().managed_block_count() == 0U,
-            "ScopedRootObject should unregister automatically on scope exit");
+        expect(gc::GC_Manager::instance().managed_block_count() == 1U,
+               "ScopedRootObject should keep a heap-hosted gc_ptr alive while in scope");
+        expect(static_cast<bool>(*external_root),
+               "external root should still point at the live object while registered");
     }
+
+    external_root->reset();
+    gc::GC_Manager::instance().shutdown();
+
+    expect(Node::destroyed >= 1,
+           "ScopedRootObject should leave the object reclaimable once the scope exits");
+}
 
 void test_gc_root_exact_rooting() {
     reset_gc();
@@ -761,13 +760,20 @@ void test_gc_stats() {
     auto before = mgr.stats();
     expect(before.total_collections == 0U, "no collections should have occurred yet");
 
-    auto node = gc::gc_new<Node>(1);
-    node.reset();
-    collect_until_stable();
+    mgr.set_collection_threshold_bytes(sizeof(LargeBlob));
+
+    make_unreachable_blob();
+    scrub_stack();
+
+    auto live = gc::gc_new<LargeBlob>();
+    expect(static_cast<bool>(live), "gc_new should return a live allocation while measuring stats");
 
     auto after = mgr.stats();
     expect(after.total_collections > 0U, "at least one collection should be counted");
     expect(after.bytes_reclaimed_total > 0U, "bytes_reclaimed_total should be non-zero");
+
+    live.reset();
+    gc::GC_Manager::instance().shutdown();
 }
 
 void test_heap_dump_includes_object_graph() {

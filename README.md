@@ -115,6 +115,17 @@ ctest --test-dir build --output-on-failure
 ./build/gc_demo
 ```
 
+Sample programs are built by default under `build/examples/`:
+
+```bash
+./build/examples/gc_example_quick_start
+./build/examples/gc_example_explicit_roots
+./build/examples/gc_example_weak_arrays
+./build/examples/gc_example_worker_threads
+```
+
+Set `-DGC_BUILD_EXAMPLES=OFF` if you want a smaller library-only build.
+
 The library also exposes install/export metadata for downstream CMake consumers:
 
 ```bash
@@ -145,6 +156,7 @@ cmake --install build --prefix /tmp/gclib-install
 .
 ├── CMakeLists.txt
 ├── cmake/
+├── examples/
 ├── include/gc/
 ├── src/
 ├── tests/
