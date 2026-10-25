@@ -71,6 +71,7 @@ jobs:
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           -DBUILD_SHARED_LIBS=${{ matrix.shared }}
+          -DGC_BUILD_BENCHMARKS=${{ matrix.build_type == 'Release' && 'ON' || 'OFF' }}
           ${{ matrix.extra_cmake }}
 
       - name: Build
@@ -79,7 +80,19 @@ jobs:
       - name: Test including installed package
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --parallel 1
 
-      - name: Verify library-only configuration
+      - name: Repeat graph stress checks
+        if: matrix.build_type == 'Release'
+        run: ctest --test-dir build -C ${{ matrix.build_type }} -L stress --repeat until-fail:3 --output-on-failure
+
+      - name: Configure library-only build
+        env:
+          CXX: ${{ matrix.cxx }}
         run: >-
           cmake -S . -B build-library-only
-          -DBUILD_TESTING=OFF -DGC_BUILD_DEMO=OFF -DGC_BUILD_EXAMPLES=OFF
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DBUILD_SHARED_LIBS=${{ matrix.shared }}
+          -DBUILD_TESTING=OFF -DGC_BUILD_DEMO=OFF -DGC_BUILD_EXAMPLES=OFF -DGC_BUILD_BENCHMARKS=OFF
+          ${{ matrix.extra_cmake }}
+
+      - name: Build library-only target
+        run: cmake --build build-library-only --config ${{ matrix.build_type }} --parallel

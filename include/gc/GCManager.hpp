@@ -10,6 +10,7 @@
 #include <iosfwd>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -30,6 +31,15 @@ struct GCStats {
     double fragmentation_ratio = 0.0;
     std::chrono::nanoseconds duration_last{0};
     std::chrono::nanoseconds duration_total{0};
+    // Successful allocation registrations, including later construction failure.
+    // Cumulative allocation counters saturate rather than wrapping on overflow.
+    std::size_t total_allocations = 0;
+    std::size_t bytes_allocated_total = 0;
+    std::size_t peak_live_bytes = 0;
+    std::size_t peak_live_blocks = 0;
+    std::size_t registered_threads = 0;
+    std::size_t registered_root_ranges = 0;
+    std::size_t registered_weak_refs = 0;
 };
 
 /// Debug snapshot of one live managed object.
@@ -89,6 +99,11 @@ public:
 
     /// Parks registered mutators and snapshots the live heap and object graph.
     std::vector<HeapObjectInfo> live_objects() const;
+
+    /// Resolves a base or interior pointer and snapshots its owning allocation.
+    /// Returns nullopt for null, unmanaged, or one-past-the-allocation pointers.
+    /// Diagnostic addresses in the result do not extend object lifetimes.
+    std::optional<HeapObjectInfo> object_info(const void* pointer) const;
 
     /// Writes a human-readable heap snapshot including outgoing references.
     void dump_heap(std::ostream& output) const;
@@ -191,6 +206,7 @@ private:
     void scan_registered_threads_locked(std::thread::id collector_thread,
                                         std::vector<BlockRecord*>& worklist);
     std::vector<void*> collect_outgoing_references_locked(const BlockRecord& block) const;
+    HeapObjectInfo describe_block_locked(const BlockRecord& block) const;
     void clear_marks_locked() noexcept;
     std::vector<ChunkHeader*> order_blocks_for_finalization_locked(
         const std::vector<BlockRecord>& blocks) const;

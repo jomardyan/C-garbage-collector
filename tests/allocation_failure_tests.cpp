@@ -94,6 +94,9 @@ void test_failed_allocation_registration() {
                "failed allocation registration must not change heap accounting");
         expect(manager.stats().reserved_bytes == 0,
                "failed allocation registration must not reserve a managed block");
+        expect(manager.stats().total_allocations == 0 && manager.stats().bytes_allocated_total == 0 &&
+                   manager.stats().peak_live_blocks == 0,
+               "failed registry insertion must not inflate allocation history or peaks");
     }
     expect(Node::constructed == 0 && Node::destroyed == 0,
            "failed allocation registration must not construct or finalize an object");
@@ -156,6 +159,40 @@ void test_shutdown_is_transactional_on_allocation_failure() {
     expect(reached_success, "shutdown must succeed after all allocation sites are traversed");
 }
 
+void test_rooted_vector_growth_failure() {
+    auto& manager = gc::GC_Manager::instance();
+    gc::shutdown();
+    Node::constructed = 0;
+    Node::destroyed = 0;
+    gc::gc_vector<Node> roots(8);
+    for (auto& root : roots) root = gc::gc_new<Node>();
+    const auto registrations = manager.stats().registered_root_ranges;
+    bool succeeded = false;
+    bool saw_failure = false;
+    for (std::ptrdiff_t offset = 0; offset < 128 && !succeeded; ++offset) {
+        bool failed = false;
+        allocation_failure::arm(offset);
+        try {
+            roots.reserve(64);
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        }
+        allocation_failure::disarm();
+        saw_failure = saw_failure || failed;
+        succeeded = !failed;
+        expect(roots.size() == 8 && manager.stats().registered_root_ranges == registrations,
+               "failed vector growth must preserve existing roots without leaking registrations");
+        gc::collect();
+        expect(Node::destroyed == 0 && manager.managed_block_count() == 8,
+               "vector growth failures must leave every original target protected");
+    }
+    expect(saw_failure && succeeded, "fault injection must exercise both failed and successful vector growth");
+    roots.clear();
+    expect(manager.stats().registered_root_ranges == 0, "cleared vector must unregister every root");
+    gc::shutdown();
+    expect(Node::destroyed == 8, "vector growth recovery must finalize each target exactly once");
+}
+
 }  // namespace
 
 int main() {
@@ -163,6 +200,7 @@ int main() {
         gc::ScopedThreadRegistration registration;
         test_failed_allocation_registration();
         test_shutdown_is_transactional_on_allocation_failure();
+        test_rooted_vector_growth_failure();
         std::cout << "Allocation failure tests passed\n";
     } catch (const std::exception& error) {
         allocation_failure::disarm();

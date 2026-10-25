@@ -5,3 +5,4 @@
 #include "gc/gc_ptr.hpp"
 #include "gc/gc_root.hpp"
 #include "gc/gc_weak_ptr.hpp"
+#include "gc/gc_vector.hpp"

@@ -24,6 +24,7 @@ gc_run("${CMAKE_COMMAND}"
     -S "${GC_SOURCE_DIR}/tests/package_consumer" -B "${consumer_build}"
     ${generator_args}
     "-DCMAKE_PREFIX_PATH=${prefix}"
+    "-DGC_SOURCE_DIR=${GC_SOURCE_DIR}"
     "-DCMAKE_CXX_COMPILER=${GC_CXX_COMPILER}")
 gc_run("${CMAKE_COMMAND}" --build "${consumer_build}" --config "${GC_CONFIG}")
 gc_run("${CMAKE_CTEST_COMMAND}" --test-dir "${consumer_build}"

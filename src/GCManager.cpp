@@ -36,6 +36,12 @@ bool add_would_overflow(std::size_t lhs, std::size_t rhs) noexcept {
     return lhs > (std::numeric_limits<std::size_t>::max)() - rhs;
 }
 
+std::size_t saturating_add(std::size_t lhs, std::size_t rhs) noexcept {
+    return add_would_overflow(lhs, rhs)
+               ? (std::numeric_limits<std::size_t>::max)()
+               : lhs + rhs;
+}
+
 std::size_t round_up_to_alignment(std::size_t value, std::size_t alignment) {
     if (alignment == 0U || (alignment & (alignment - 1U)) != 0U) {
         throw std::bad_alloc();
@@ -220,6 +226,9 @@ GCStats GC_Manager::stats() const {
     snapshot.live_bytes = managed_bytes_;
     snapshot.live_blocks = allocations_.size();
     snapshot.reserved_bytes = reserved_bytes_;
+    snapshot.registered_threads = threads_.size();
+    snapshot.registered_root_ranges = registered_root_ranges_.size();
+    snapshot.registered_weak_refs = weak_refs_.size();
     snapshot.fragmentation_ratio =
         reserved_bytes_ == 0U
             ? 0.0
@@ -247,16 +256,7 @@ std::vector<HeapObjectInfo> GC_Manager::live_objects() const {
         objects.reserve(allocations_.size());
         for (const auto& [payload_addr, block] : allocations_) {
             (void)payload_addr;
-            const ChunkHeader* header = block.header;
-            objects.push_back(HeapObjectInfo{
-                payload_pointer(const_cast<ChunkHeader*>(header)),
-                header->size,
-                block_allocation_size(header),
-                header->payload_offset,
-                header->allocation_alignment(),
-                header->is_marked(),
-                collect_outgoing_references_locked(block),
-            });
+            objects.push_back(describe_block_locked(block));
         }
     } catch (...) {
         if (owns_stop_the_world) self->release_stop_the_world();
@@ -264,6 +264,32 @@ std::vector<HeapObjectInfo> GC_Manager::live_objects() const {
     }
     if (owns_stop_the_world) self->release_stop_the_world();
     return objects;
+}
+
+std::optional<HeapObjectInfo> GC_Manager::object_info(const void* pointer) const {
+    if (pointer == nullptr) return std::nullopt;
+
+    auto* self = const_cast<GC_Manager*>(this);
+    bool owns_stop_the_world = false;
+    std::optional<HeapObjectInfo> object;
+    try {
+        std::unique_lock<std::mutex> lock(mutex_);
+        self->cooperate_with_stop_the_world_locked(lock);
+        if (!collecting_.load(std::memory_order_relaxed)) {
+            self->collecting_.store(true, std::memory_order_relaxed);
+            self->collector_thread_ = std::this_thread::get_id();
+            self->stop_the_world_requested_ = true;
+            owns_stop_the_world = true;
+            self->wait_for_other_threads_to_pause_locked(lock, self->collector_thread_);
+        }
+        const auto* block = find_block_locked(reinterpret_cast<std::uintptr_t>(pointer));
+        if (block != nullptr) object = describe_block_locked(*block);
+    } catch (...) {
+        if (owns_stop_the_world) self->release_stop_the_world();
+        throw;
+    }
+    if (owns_stop_the_world) self->release_stop_the_world();
+    return object;
 }
 
 void GC_Manager::dump_heap(std::ostream& output) const {
@@ -756,6 +782,19 @@ std::vector<void*> GC_Manager::collect_outgoing_references_locked(
     return references;
 }
 
+HeapObjectInfo GC_Manager::describe_block_locked(const BlockRecord& block) const {
+    const auto* header = block.header;
+    return HeapObjectInfo{
+        payload_pointer(block.header),
+        header->size,
+        block_allocation_size(header),
+        header->payload_offset,
+        header->allocation_alignment(),
+        header->is_marked(),
+        collect_outgoing_references_locked(block),
+    };
+}
+
 GC_Manager::BlockRecord* GC_Manager::find_block_locked(
     std::uintptr_t address) noexcept {
     auto it = allocations_.upper_bound(address);
@@ -787,6 +826,10 @@ void GC_Manager::register_block_locked(ChunkHeader* header) {
     allocations_.emplace(begin, BlockRecord{header, begin, begin + header->size});
     managed_bytes_ += header->size;
     reserved_bytes_ += block_allocation_size(header);
+    stats_.total_allocations = saturating_add(stats_.total_allocations, 1U);
+    stats_.bytes_allocated_total = saturating_add(stats_.bytes_allocated_total, header->size);
+    stats_.peak_live_bytes = (std::max)(stats_.peak_live_bytes, managed_bytes_);
+    stats_.peak_live_blocks = (std::max)(stats_.peak_live_blocks, allocations_.size());
 }
 
 std::vector<ChunkHeader*> GC_Manager::order_blocks_for_finalization_locked(

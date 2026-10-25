@@ -1,0 +1,23 @@
+# Each generated source includes exactly one installed or source public header.
+# Building this object target verifies that headers are self-contained C++20.
+function(gc_add_header_checks target header_directory link_target)
+    file(GLOB headers CONFIGURE_DEPENDS RELATIVE "${header_directory}"
+        "${header_directory}/gc/*.hpp")
+    if(NOT headers)
+        message(FATAL_ERROR "No GC public headers found in ${header_directory}")
+    endif()
+    set(sources)
+    foreach(header IN LISTS headers)
+        string(MAKE_C_IDENTIFIER "${header}" source_name)
+        set(source "${CMAKE_CURRENT_BINARY_DIR}/${target}/${source_name}.cpp")
+        file(GENERATE OUTPUT "${source}" CONTENT "#include <${header}>\n")
+        list(APPEND sources "${source}")
+    endforeach()
+    add_library(${target} OBJECT ${sources})
+    target_link_libraries(${target} PRIVATE ${link_target})
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endfunction()

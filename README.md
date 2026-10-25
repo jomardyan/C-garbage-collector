@@ -14,17 +14,21 @@ Because the collector is conservative, ambiguous stack or global words can delay
 - Automatic threshold-triggered collection via `collect_if_needed()`.
 - `gc_ptr<T>` strong handles with STL ordering/hash support.
 - `gc_root<T>` exact RAII roots for optimization-robust local rooting.
+- `gc_vector<T>` for collections whose elements remain rooted through growth, copying, and moves.
 - `gc_weak_ptr<T>` and `gc_weak_ptr<T[]>` weak handles that are nulled during sweep/shutdown.
 - `gc_new<T>()`, `gc_new_nothrow<T>()`, `gc_new_array<T>()`, and `gc_new_array_nothrow<T>()`.
+- Fill-copy and indexed generator arrays, including move-only and non-default-constructible elements.
 - Over-aligned allocation support.
 - Cooperative multi-thread stop-the-world collection using per-thread registration and safepoints.
 - Automatic current-thread registration through `gc::register_current_thread()` or `gc::ScopedThreadRegistration`.
 - Explicit root-range registration for heap-hosted or external roots.
 - Heap inspection APIs through `GC_Manager::live_objects()` and `GC_Manager::dump_heap()`.
+- Targeted base/interior-pointer inspection through `object_info()`, allocation totals, peak usage, and registration counts.
 - Collection statistics including reclaimed bytes, durations, live bytes, reserved bytes, and fragmentation ratio.
 - Dependency-aware finalization ordering during sweep and shutdown.
 - Cross-platform global/static scanning on Linux, macOS, and Windows.
 - CMake install/export support and CI sanitizer builds.
+- Optional CSV benchmarks with correctness checks, throughput, and collection-duration distributions.
 
 ## Quick Start
 
@@ -58,6 +62,43 @@ int main(int argc, char** argv) {
 ```
 
 For local variables that must stay alive across optimized builds without relying on conservative register discovery, prefer `gc_root<T>` over a plain stack `gc_ptr<T>`.
+
+## Rooted Collections
+
+Ordinary STL containers keep their elements in native heap memory that the collector does not trace. `gc_vector<T>` stores an exact `gc_root<T>` for each element, so a vector hosted on the stack or ordinary heap protects its targets:
+
+```cpp
+gc::gc_vector<MyNode> nodes;
+nodes.emplace_new();                  // construct and root a new MyNode
+nodes.push_back(gc::gc_new<MyNode>()); // root an existing handle
+nodes.reserve(128);
+gc::collect();
+nodes[0]->next = nodes[1].as_gc_ptr();
+
+for (const auto& root : nodes) {
+    use_node(root.as_gc_ptr());
+}
+nodes.clear(); // release exact roots; future collections may reclaim targets
+```
+
+Elements and iterators expose `gc_root<T>` handles. Bounds-checked `at()`, iteration, `erase()`, `pop_back()`, `resize()`, copying, moving, and swapping follow vector conventions. New slots created by `resize()` are null. Iterator/reference invalidation follows `std::vector`; managed target addresses remain stable. `gc_vector<T[]>` also holds array roots. `emplace_new()` constructs scalar objects; use `push_back(gc_new_array<T>(...))` for arrays.
+
+Each element uses one explicit root registration. Growth can temporarily register copies of those roots and can throw on allocation failure. Reserve capacity when the expected size is known. Container operations and target access still require registered mutator threads and normal application synchronization.
+
+Treat `gc_vector` as an external root owner. If it is embedded in a managed object and an element leads back to that owner, the unconditional root can keep the cycle alive until those slots are cleared explicitly.
+
+## Filled and Generated Arrays
+
+```cpp
+gc::gc_root<int[]> filled(gc::gc_new_array<int>(8, 42));
+gc::gc_root<int[]> squares(gc::gc_generate_array<int>(8, [](std::size_t index) {
+    return static_cast<int>(index * index);
+}));
+```
+
+The fill overload copy-constructs each element from the supplied value. The generator is called once for each index in increasing order and constructs elements directly, supporting non-default-constructible and move-only values. Zero-length arrays return null and never invoke the generator. If construction throws, completed elements are destroyed in reverse order and the block is released. Matching `gc_new_array_nothrow(count, value)` and `gc_generate_array_nothrow(count, generator)` return null on failure.
+
+Root any managed targets referenced by the fill value or captured by the generator; closures and native containers do not automatically become roots.
 
 ## Multi-Threaded Use
 
@@ -109,10 +150,15 @@ gc::collect();
 ```cpp
 auto stats = gc::GC_Manager::instance().stats();
 auto live = gc::GC_Manager::instance().live_objects();
+auto object = gc::GC_Manager::instance().object_info(pointer);
 gc::GC_Manager::instance().dump_heap(std::cout);
 ```
 
 `live_objects()` returns per-object payload size, reserved size, alignment, mark state, and outgoing references. `dump_heap()` emits a human-readable heap snapshot and object graph. Snapshot addresses are diagnostic values; they do not extend object lifetimes. Each query is a separate snapshot, so concurrent allocations can change counts between queries.
+
+`object_info()` resolves a payload base or any interior byte to its owning allocation, returning `std::nullopt` for null, unknown, or one-past-the-allocation addresses. Array element pointers resolve to the allocation containing the count prefix. It parks registered mutators before reading outgoing references, just as a whole-heap snapshot does.
+
+`GCStats` also reports `total_allocations`, `bytes_allocated_total`, `peak_live_bytes`, `peak_live_blocks`, `registered_threads`, `registered_root_ranges`, and `registered_weak_refs`. Allocation totals count successful registry insertions, including blocks later released because a constructor throws. Byte counters describe managed payloads, including array prefixes; they exclude native container storage and collector bookkeeping. Allocation totals saturate on overflow. `shutdown()` resets allocation history and peaks while preserving active thread/root registrations.
 
 ## Build and Run
 
@@ -160,6 +206,8 @@ target_link_libraries(my_app PRIVATE GCLib::gc_lib)
 
 Pass `-DCMAKE_PREFIX_PATH=/tmp/gclib-install` when configuring the consumer.
 
+Version 0.2 adds fields to the public `GCStats` structure. Rebuild downstream binaries when upgrading from 0.1; shared libraries use a separate 0.2 ABI version. Existing source consumers can still request `find_package(GCLib 0.1 CONFIG REQUIRED)` and rebuild against the new headers.
+
 ## Validation
 
 ```bash
@@ -179,6 +227,37 @@ ctest --test-dir build/tsan --output-on-failure
 Sanitizers require GCC or Clang and must use separate build directories; ASan and TSan cannot be enabled together. Instrumentation covers the library, public templates, tests, and examples. The scanner's raw conservative reads are excluded from TSan instrumentation. The standalone, single-threaded allocation-failure test also runs without TSan because its replacement `operator new/delete` conflicts with Clang's TSan runtime; it remains enabled and is instrumented in ASan builds. CTest sets `ASAN_OPTIONS=detect_stack_use_after_return=0`; use the same setting when running ASan examples directly. ASan scanning skips poisoned words. Tests cover construction failures, nested roots, shutdown/reuse, concurrent collection and snapshots, weak promotion, global BSS roots, and installed-package consumption.
 
 CI runs Linux Release, Debug/shared, ASan/UBSan, and TSan builds, plus macOS and Windows builds. A local Linux pass does not validate other operating systems; check the corresponding CI jobs before release.
+
+The runtime suites cover:
+
+| Area | Checks |
+| --- | --- |
+| Core collection | Reachable/deep graphs, dead cycles, interior pointers, thresholds, arrays, alignment, weak handles, STL compatibility |
+| Lifecycle and concurrency | Nested registrations, shutdown/reuse, constructor collection, competing collectors, snapshots, weak promotion |
+| New APIs | Vector growth/copy/move/erase, generated/fill arrays, partial failure cleanup, object lookup boundaries, cumulative and peak statistics |
+| Property tests | Eight fixed random graph seeds, model-derived reachability through staged root removal, weak expiry, a 4,096-node cycle |
+| Failure contracts | Registry/graph allocation failure, rooted-vector growth failure, DAG finalizer order, recursive collection, throwing finalizers in isolated processes |
+| Integration | Every public header compiled independently, installed-package consumers, demo/example runs, benchmark output and invalid CLI arguments |
+
+CTest labels support focused runs:
+
+```bash
+ctest --test-dir build/release -L unit --output-on-failure
+ctest --test-dir build/release -L stress --output-on-failure
+ctest --test-dir build/release -L integration --output-on-failure
+```
+
+Reclamation assertions use fresh registered collector threads after the allocating thread relinquishes its roots, avoiding reliance on stale conservative stack values disappearing. Retention assertions run with their intended roots registered. Checks remain active in Release builds. Passing these suites does not establish exhaustive coverage of every workload or thread schedule.
+
+## Performance Benchmarks
+
+```bash
+cmake -S . -B build/bench -DCMAKE_BUILD_TYPE=Release -DGC_BUILD_BENCHMARKS=ON
+cmake --build build/bench --parallel
+./build/bench/gc_bench --objects 10000 --iterations 20 > results.csv
+```
+
+The optional tool measures rooted allocation, retained and reclaimed graph collection, array construction, and weak registration/promotion. CSV output includes throughput and median/p95/maximum iteration durations. Each workload verifies object counts and finalization; timings have no pass/fail threshold. Compare repeated Release builds on the same machine. These synthetic measurements do not establish production latency or a speedup over earlier versions. See [benchmark methodology](benchmarks/README.md) for timed regions, CLI limits, and interpretation.
 
 ## Lifetime and Finalization
 
@@ -214,6 +293,7 @@ Finalizers run on the collecting thread while other mutators are parked. They mu
 ├── CMakeLists.txt
 ├── cmake/
 ├── examples/
+├── benchmarks/
 ├── include/gc/
 ├── src/
 ├── tests/

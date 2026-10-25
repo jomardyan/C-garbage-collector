@@ -1,0 +1,7 @@
+if(WIN32)
+    set(ENV{PATH} "${GC_LIBRARY_DIR};$ENV{PATH}")
+endif()
+execute_process(COMMAND "${GC_EXECUTABLE}" RESULT_VARIABLE result)
+if(NOT "${result}" STREQUAL "0")
+    message(FATAL_ERROR "${GC_EXECUTABLE} failed (${result})")
+endif()

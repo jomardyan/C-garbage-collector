@@ -16,6 +16,7 @@ Makefile
 *.cmake
 !cmake/*.cmake
 !cmake/GCLibConfig.cmake.in
+!tests/RunFinalizerContract.cmake
 
 # Compiled binaries
 *.o
