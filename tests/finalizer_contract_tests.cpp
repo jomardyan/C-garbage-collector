@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
@@ -201,38 +202,64 @@ void test_reentrant_collect_and_shutdown() {
 struct FinalizerException {};
 struct ConstructionException {};
 
+bool cleanup_termination_test = false;
+
+void cleanup_trace(const char* stage) noexcept {
+    std::fputs("cleanup contract: ", stderr);
+    std::fputs(stage, stderr);
+    std::fputc('\n', stderr);
+    std::fflush(stderr);
+}
+
 struct ThrowingFinalizer {
     ~ThrowingFinalizer() noexcept(false) { throw FinalizerException{}; }
 };
 
 struct ThrowingCleanupElement {
     static inline std::size_t attempts = 0;
+    // Retain a real return path in the destructor when compiling with MSVC;
+    // the contract sets this runtime flag before entering partial cleanup.
+    static inline volatile bool throw_from_destructor = false;
     std::size_t index;
 
     ThrowingCleanupElement() : index(attempts++) {
-        if (index == 1) throw ConstructionException{};
+        if (index == 1) {
+            cleanup_trace("element one constructor throws");
+            throw ConstructionException{};
+        }
+        cleanup_trace("element zero constructor completed");
     }
     ThrowingCleanupElement(const ThrowingCleanupElement&) = delete;
     ThrowingCleanupElement(ThrowingCleanupElement&&) = delete;
 
     ~ThrowingCleanupElement() noexcept(false) {
+        cleanup_trace("completed element destructor entered");
         // Verify this is cleanup of element zero after element one failed,
         // rather than termination from destroying an unexpected temporary.
         if (attempts != 2 || index != 0) std::_Exit(78);
-        throw FinalizerException{};
+        if (throw_from_destructor) {
+            cleanup_trace("completed element destructor throws");
+            throw FinalizerException{};
+        }
+        cleanup_trace("completed element destructor returned");
     }
 };
 
 [[noreturn]] void finalizer_terminate_handler() noexcept {
     // A distinctive code proves terminate ran with the expected destructor
     // exception; a generic crash or some other terminate path does not pass.
+    if (cleanup_termination_test) cleanup_trace("terminate handler entered");
     const auto error = std::current_exception();
+    if (cleanup_termination_test) cleanup_trace("current_exception returned");
     if (!error) std::_Exit(74);
     try {
+        if (cleanup_termination_test) cleanup_trace("rethrowing current exception");
         std::rethrow_exception(error);
     } catch (const FinalizerException&) {
+        if (cleanup_termination_test) cleanup_trace("expected finalizer exception caught");
         std::_Exit(73);
     } catch (...) {
+        if (cleanup_termination_test) cleanup_trace("unexpected exception caught");
         std::_Exit(75);
     }
 }
@@ -259,8 +286,11 @@ struct ThrowingCleanupElement {
 
 [[noreturn]] void test_throwing_cleanup_finalizer() {
     gc::ScopedThreadRegistration registration;
+    cleanup_termination_test = true;
     std::set_terminate(finalizer_terminate_handler);
     ThrowingCleanupElement::attempts = 0;
+    ThrowingCleanupElement::throw_from_destructor = true;
+    cleanup_trace("array construction starting");
     try {
         // Exercise the shared partial-array cleanup directly. Using a
         // noncopyable, nonmovable element avoids generator return temporaries
@@ -269,6 +299,7 @@ struct ThrowingCleanupElement {
     } catch (...) {
         // Neither the original constructor exception nor the cleanup destructor
         // exception may escape after a finalizer has thrown.
+        cleanup_trace("an exception escaped partial-array cleanup");
         std::_Exit(76);
     }
     std::_Exit(77);

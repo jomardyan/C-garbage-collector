@@ -82,8 +82,13 @@ struct ArrayDestructor {
     static void destroy(void* payload) noexcept {
         const std::size_t count = *static_cast<std::size_t*>(payload);
         T* elems = array_elements_begin<T>(payload);
-        for (std::size_t i = count; i > 0U; --i) {
-            elems[i - 1U].~T();
+        try {
+            for (std::size_t i = count; i > 0U; --i) {
+                elems[i - 1U].~T();
+            }
+        } catch (...) {
+            // Keep the finalizer exception active when invoking terminate.
+            std::terminate();
         }
     }
 };
@@ -127,6 +132,7 @@ gc_ptr<T[]> construct_array(std::size_t count, Construct&& construct) {
     *prefix = 0U;
 
     std::size_t constructed = 0U;
+    std::exception_ptr construction_failure;
     try {
         for (; constructed < count; ++constructed) {
             void* element = static_cast<unsigned char*>(payload) + prefix_size + constructed * sizeof(T);
@@ -134,18 +140,16 @@ gc_ptr<T[]> construct_array(std::size_t count, Construct&& construct) {
             *prefix = constructed + 1U;  // keep count current for the destructor
         }
     } catch (...) {
-        // Preserve the construction exception when cleanup succeeds. A throwing
-        // finalizer must terminate, including during partial-array cleanup;
-        // unwinding past it would leave a permanently constructing GC block.
-        try {
-            for (std::size_t i = constructed; i > 0U; --i) {
-                elems[i - 1U].~T();
-            }
-        } catch (...) {
-            std::terminate();
-        }
+        construction_failure = std::current_exception();
+    }
+
+    if (construction_failure) {
+        // Leave the construction handler before invoking user finalizers. Share
+        // the noexcept boundary used by normal array destruction, so a throwing
+        // cleanup destructor terminates with its own exception active.
+        ArrayDestructor<T>::destroy(payload);
         manager.release_unconstructed(payload);
-        throw;
+        std::rethrow_exception(construction_failure);
     }
 
     manager.finish_construction(payload);
