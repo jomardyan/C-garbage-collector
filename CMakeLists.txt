@@ -119,7 +119,13 @@ if(BUILD_TESTING)
     target_include_directories(gc_allocation_failure_tests PRIVATE include)
     target_compile_features(gc_allocation_failure_tests PRIVATE cxx_std_20)
     target_link_libraries(gc_allocation_failure_tests PRIVATE Threads::Threads)
-    gc_enable_sanitizers(gc_allocation_failure_tests)
+    # This single-threaded test replaces operator new/delete to inject failures.
+    # Clang's TSan runtime provides strong definitions of the same operators, so
+    # keep this standalone executable uninstrumented in TSan builds. The library
+    # and the other tests retain full TSan instrumentation; ASan still covers it.
+    if(NOT GC_ENABLE_TSAN)
+        gc_enable_sanitizers(gc_allocation_failure_tests)
+    endif()
     gc_register_test(gc_allocation_failure_tests)
 
     add_test(NAME gc_package_consumer

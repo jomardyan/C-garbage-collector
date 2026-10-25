@@ -28,6 +28,9 @@
 #include <mach-o/getsect.h>
 #include <mach-o/loader.h>
 #elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -110,6 +113,10 @@ GC_NOINLINE void scan_registers_frame(
 
     std::jmp_buf registers;
     std::memset(&registers, 0, sizeof(registers));
+#if defined(_MSC_VER)
+    // Capture register roots only; this buffer is never passed to longjmp.
+#pragma warning(suppress : 4611)
+#endif
     if (setjmp(registers) == 0) {
         const auto* end =
             reinterpret_cast<const unsigned char*>(&registers) + sizeof(registers);
@@ -171,7 +178,7 @@ int scan_linux_image(dl_phdr_info* image, std::size_t, void* opaque) noexcept {
             }
             const auto begin = static_cast<std::uintptr_t>(image->dlpi_addr) +
                                static_cast<std::uintptr_t>(segment.p_vaddr);
-            if (segment.p_memsz > std::numeric_limits<std::uintptr_t>::max() - begin) {
+            if (segment.p_memsz > (std::numeric_limits<std::uintptr_t>::max)() - begin) {
                 continue;
             }
             scan_words(reinterpret_cast<const void*>(begin),

@@ -176,7 +176,7 @@ cmake --build build/tsan --parallel
 ctest --test-dir build/tsan --output-on-failure
 ```
 
-Sanitizers require GCC or Clang and must use separate build directories; ASan and TSan cannot be enabled together. Instrumentation covers the library, public templates, tests, and examples. Only the scanner's raw conservative reads are excluded from TSan instrumentation. CTest sets `ASAN_OPTIONS=detect_stack_use_after_return=0`; use the same setting when running ASan examples directly. ASan scanning skips poisoned words. Tests cover construction failures, nested roots, shutdown/reuse, concurrent collection and snapshots, weak promotion, global BSS roots, and installed-package consumption.
+Sanitizers require GCC or Clang and must use separate build directories; ASan and TSan cannot be enabled together. Instrumentation covers the library, public templates, tests, and examples. The scanner's raw conservative reads are excluded from TSan instrumentation. The standalone, single-threaded allocation-failure test also runs without TSan because its replacement `operator new/delete` conflicts with Clang's TSan runtime; it remains enabled and is instrumented in ASan builds. CTest sets `ASAN_OPTIONS=detect_stack_use_after_return=0`; use the same setting when running ASan examples directly. ASan scanning skips poisoned words. Tests cover construction failures, nested roots, shutdown/reuse, concurrent collection and snapshots, weak promotion, global BSS roots, and installed-package consumption.
 
 CI runs Linux Release, Debug/shared, ASan/UBSan, and TSan builds, plus macOS and Windows builds. A local Linux pass does not validate other operating systems; check the corresponding CI jobs before release.
 

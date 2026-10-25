@@ -1,3 +1,8 @@
+#if defined(_WIN32)
+// Exercise the public headers with the Windows min/max macros already defined.
+#include <windows.h>
+#endif
+
 #include <gc/GC.hpp>
 
 struct Object {

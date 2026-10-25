@@ -69,11 +69,11 @@ gc_ptr<T[]> gc_new_array_nothrow(std::size_t count) noexcept {
 namespace detail {
 
 constexpr bool add_would_overflow(std::size_t lhs, std::size_t rhs) noexcept {
-    return lhs > std::numeric_limits<std::size_t>::max() - rhs;
+    return lhs > (std::numeric_limits<std::size_t>::max)() - rhs;
 }
 
 constexpr bool multiply_would_overflow(std::size_t lhs, std::size_t rhs) noexcept {
-    return rhs != 0U && lhs > std::numeric_limits<std::size_t>::max() / rhs;
+    return rhs != 0U && lhs > (std::numeric_limits<std::size_t>::max)() / rhs;
 }
 
 constexpr std::size_t round_up_to_alignment(std::size_t value,

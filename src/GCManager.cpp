@@ -17,6 +17,9 @@
 #endif
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -26,11 +29,11 @@ namespace gc {
 namespace {
 
 std::size_t normalize_alignment(std::size_t alignment) noexcept {
-    return std::max(alignment, alignof(std::max_align_t));
+    return (std::max)(alignment, alignof(std::max_align_t));
 }
 
 bool add_would_overflow(std::size_t lhs, std::size_t rhs) noexcept {
-    return lhs > std::numeric_limits<std::size_t>::max() - rhs;
+    return lhs > (std::numeric_limits<std::size_t>::max)() - rhs;
 }
 
 std::size_t round_up_to_alignment(std::size_t value, std::size_t alignment) {
@@ -310,7 +313,7 @@ void* GC_Manager::malloc_internal(std::size_t payload_size,
     const std::size_t alignment = normalize_alignment(payload_alignment);
     const std::size_t p_offset = round_up_to_alignment(sizeof(ChunkHeader), alignment);
 
-    if (p_offset > std::numeric_limits<std::uint16_t>::max() ||
+    if (p_offset > (std::numeric_limits<std::uint16_t>::max)() ||
         add_would_overflow(p_offset, payload_size)) {
         throw std::bad_alloc();
     }
@@ -405,7 +408,7 @@ void GC_Manager::collect_if_needed(std::size_t incoming_payload_bytes) {
         require_registered_thread_locked(std::this_thread::get_id());
         const std::size_t projected =
             add_would_overflow(managed_bytes_, incoming_payload_bytes)
-                ? std::numeric_limits<std::size_t>::max()
+                ? (std::numeric_limits<std::size_t>::max)()
                 : managed_bytes_ + incoming_payload_bytes;
         should_collect =
             !collecting_.load(std::memory_order_relaxed) &&
@@ -641,6 +644,10 @@ void GC_Manager::cooperate_with_stop_the_world_locked(
     std::memset(&registers, 0, sizeof(registers));
 
     lock.unlock();
+#if defined(_MSC_VER)
+    // Capture register roots only; this buffer is never passed to longjmp.
+#pragma warning(suppress : 4611)
+#endif
     if (setjmp(registers) != 0) {
         lock.lock();
         return;

@@ -144,15 +144,34 @@ void reset_gc() {
     scrub_stack();
 }
 
-void collect_until_stable() {
-    auto& manager = gc::GC_Manager::instance();
-    for (int pass = 0; pass < 8; ++pass) {
-        scrub_stack();
-        manager.collect();
-        if (manager.managed_block_count() == 0U) {
-            return;
-        }
+// Only use after releasing the caller's local strong roots. A conservative
+// scanner may retain stale pointer words in that stack indefinitely, even after
+// assigning null or returning from a noinline helper. Exclude the caller's stack
+// for reclamation checks; retention checks still scan it in the normal way.
+template <typename Action>
+void on_fresh_registered_thread(Action action) {
+    gc::unregister_current_thread();
+    std::exception_ptr error;
+    try {
+        std::thread worker([&] {
+            try {
+                gc::ScopedThreadRegistration registration;
+                action();
+            } catch (...) {
+                error = std::current_exception();
+            }
+        });
+        worker.join();
+    } catch (...) {
+        gc::register_current_thread();
+        throw;
     }
+    gc::register_current_thread();
+    if (error) std::rethrow_exception(error);
+}
+
+void collect_without_caller_stack() {
+    on_fresh_registered_thread([] { gc::collect(); });
 }
 
 GC_NOINLINE void make_cycle() {
@@ -202,7 +221,7 @@ GC_NOINLINE void register_and_unregister_external_root() {
 void test_cycle_reclamation() {
     reset_gc();
     make_cycle();
-    collect_until_stable();
+    collect_without_caller_stack();
 
     expect(gc::GC_Manager::instance().managed_block_count() == 0U,
            "unreachable cycle should be reclaimed");
@@ -213,8 +232,7 @@ void test_reachable_chain() {
     reset_gc();
 
     make_reachable_chain();
-    scrub_stack();
-    gc::GC_Manager::instance().collect();
+    collect_without_caller_stack();
     expect(gc::GC_Manager::instance().managed_block_count() == 0U,
            "chain should be reclaimed after the last root is dropped");
     expect(Node::destroyed >= 3, "chain destructors should run");
@@ -225,7 +243,7 @@ void test_deep_reachable_chain() {
 
     make_deep_chain();
     scrub_stack();
-    collect_until_stable();
+    collect_without_caller_stack();
 
     expect(gc::GC_Manager::instance().managed_block_count() == 0U,
            "deep chain should be reclaimed after its last root is dropped");
@@ -247,7 +265,7 @@ GC_NOINLINE void keep_interior_pointer_alive() {
 void test_interior_pointer() {
     reset_gc();
     keep_interior_pointer_alive();
-    collect_until_stable();
+    collect_without_caller_stack();
 
     expect(gc::GC_Manager::instance().managed_block_count() == 0U,
            "object should be reclaimed once the interior pointer disappears");
@@ -277,7 +295,7 @@ void test_unaligned_interior_pointer() {
 
     manager.unregister_root_object(interior.get());
     *interior = 0U;
-    collect_until_stable();
+    collect_without_caller_stack();
 
     expect(manager.managed_block_count() == 0U,
            "object should be reclaimed once the unaligned interior pointer disappears");
@@ -294,8 +312,9 @@ void test_threshold_trigger() {
     auto& manager = gc::GC_Manager::instance();
     manager.set_collection_threshold_bytes(sizeof(LargeBlob));
 
-    make_unreachable_blob();
-    scrub_stack();
+    // The allocating worker exits before the automatic threshold collection,
+    // so stale pointer words in its stack cannot retain this garbage.
+    on_fresh_registered_thread([] { make_unreachable_blob(); });
 
     auto live = gc::gc_new<LargeBlob>();
     expect(static_cast<bool>(live), "gc_new should return a live pointer");
@@ -305,7 +324,7 @@ void test_threshold_trigger() {
            "threshold collection should leave only the new rooted allocation");
 
     live.reset();
-    collect_until_stable();
+    collect_without_caller_stack();
 }
 
 GC_NOINLINE void allocate_over_aligned_object() {
@@ -320,7 +339,7 @@ GC_NOINLINE void allocate_over_aligned_object() {
 void test_over_aligned_allocation() {
     reset_gc();
     allocate_over_aligned_object();
-    collect_until_stable();
+    collect_without_caller_stack();
 
     expect(gc::GC_Manager::instance().managed_block_count() == 0U,
            "over-aligned object should be reclaimed normally");
@@ -333,7 +352,7 @@ void test_registered_external_root_range() {
 
     register_and_unregister_external_root();
     scrub_stack();
-    collect_until_stable();
+    collect_without_caller_stack();
 
     expect(gc::GC_Manager::instance().managed_block_count() == 0U,
            "object should be reclaimed after unregistering the external root range");
@@ -455,8 +474,8 @@ void test_registered_cross_thread_use_is_supported() {
     expect(manager.managed_block_count() == 1U,
            "registered cross-thread allocation should survive while the worker holds the root");
 
-        published.store(0U, std::memory_order_release);
-        raw = nullptr;
+    published.store(0U, std::memory_order_release);
+    raw = nullptr;
 
     release.store(true, std::memory_order_release);
     worker.join();
@@ -466,7 +485,7 @@ void test_registered_cross_thread_use_is_supported() {
     }
 
     scrub_stack();
-    collect_until_stable();
+    collect_without_caller_stack();
 
     expect(manager.managed_block_count() == 0U,
            "registered cross-thread object should be reclaimable after the worker exits");
@@ -496,7 +515,7 @@ void test_gc_new_nothrow() {
     expect(p->value == 42, "gc_new_nothrow object should have correct value");
 
     p.reset();
-    collect_until_stable();
+    collect_without_caller_stack();
 }
 
 void test_gc_new_array_basic() {
@@ -571,7 +590,7 @@ void test_gc_weak_ptr_basic() {
     gc::gc_weak_ptr<Node> weak;
     setup_weak_basic(weak);
     scrub_stack();
-    collect_until_stable();
+    collect_without_caller_stack();
 
     expect(weak.expired(), "weak ptr should be expired after GC reclaims the object");
     auto dead = weak.lock();
@@ -592,7 +611,7 @@ void test_gc_weak_ptr_copy() {
     gc::gc_weak_ptr<Node> w2;
     setup_weak_copy(w1, w2);
     scrub_stack();
-    collect_until_stable();
+    collect_without_caller_stack();
 
     expect(w1.expired(), "original weak ptr should expire after reclamation");
     expect(w2.expired(), "copied weak ptr should also expire after reclamation");
@@ -612,7 +631,7 @@ void test_gc_weak_ptr_move() {
     gc::gc_weak_ptr<Node> w2;
     setup_weak_move(w2);
     scrub_stack();
-    collect_until_stable();
+    collect_without_caller_stack();
 
     expect(w2.expired(), "moved-to weak ptr should expire after reclamation");
 }
@@ -631,7 +650,7 @@ void test_gc_weak_ptr_reset() {
            "object should still be alive — only the weak ptr was reset");
 
     node.reset();
-    collect_until_stable();
+    collect_without_caller_stack();
 }
 
 GC_NOINLINE void setup_weak_array_basic(gc::gc_weak_ptr<Buffer[]>& out) {
@@ -700,7 +719,14 @@ void test_gc_ptr_stl_compatibility() {
 
     a.reset();
     b.reset();
-    collect_until_stable();
+    orig_a.reset();
+    umap.clear();
+    uset.clear();
+    omap.clear();
+    oset.clear();
+    collect_without_caller_stack();
+    expect(gc::GC_Manager::instance().managed_block_count() == 0U && Node::destroyed == 2,
+           "clearing STL handles should allow both objects to be reclaimed");
 }
 
 void test_gc_ptr_array_stl_compatibility() {
@@ -756,7 +782,8 @@ void test_gc_ptr_casts() {
     b.reset();
     d2.reset();
     b2.reset();
-    collect_until_stable();
+    d3.reset();
+    collect_without_caller_stack();
 }
 
 void test_gc_stats() {
@@ -768,8 +795,9 @@ void test_gc_stats() {
 
     mgr.set_collection_threshold_bytes(sizeof(LargeBlob));
 
-    make_unreachable_blob();
-    scrub_stack();
+    // The allocating worker exits before the automatic threshold collection,
+    // so stale pointer words in its stack cannot retain this garbage.
+    on_fresh_registered_thread([] { make_unreachable_blob(); });
 
     auto live = gc::gc_new<LargeBlob>();
     expect(static_cast<bool>(live), "gc_new should return a live allocation while measuring stats");
