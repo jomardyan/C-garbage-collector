@@ -205,6 +205,24 @@ struct ThrowingFinalizer {
     ~ThrowingFinalizer() noexcept(false) { throw FinalizerException{}; }
 };
 
+struct ThrowingCleanupElement {
+    static inline std::size_t attempts = 0;
+    std::size_t index;
+
+    ThrowingCleanupElement() : index(attempts++) {
+        if (index == 1) throw ConstructionException{};
+    }
+    ThrowingCleanupElement(const ThrowingCleanupElement&) = delete;
+    ThrowingCleanupElement(ThrowingCleanupElement&&) = delete;
+
+    ~ThrowingCleanupElement() noexcept(false) {
+        // Verify this is cleanup of element zero after element one failed,
+        // rather than termination from destroying an unexpected temporary.
+        if (attempts != 2 || index != 0) std::_Exit(78);
+        throw FinalizerException{};
+    }
+};
+
 [[noreturn]] void finalizer_terminate_handler() noexcept {
     // A distinctive code proves terminate ran with the expected destructor
     // exception; a generic crash or some other terminate path does not pass.
@@ -242,13 +260,14 @@ struct ThrowingFinalizer {
 [[noreturn]] void test_throwing_cleanup_finalizer() {
     gc::ScopedThreadRegistration registration;
     std::set_terminate(finalizer_terminate_handler);
+    ThrowingCleanupElement::attempts = 0;
     try {
-        (void)gc::gc_generate_array<ThrowingFinalizer>(2, [](std::size_t index) {
-            if (index == 1) throw ConstructionException{};
-            return ThrowingFinalizer{};
-        });
+        // Exercise the shared partial-array cleanup directly. Using a
+        // noncopyable, nonmovable element avoids generator return temporaries
+        // and tests precisely the destructor of the completed array element.
+        (void)gc::gc_new_array<ThrowingCleanupElement>(2);
     } catch (...) {
-        // Neither the original generator exception nor the cleanup destructor
+        // Neither the original constructor exception nor the cleanup destructor
         // exception may escape after a finalizer has thrown.
         std::_Exit(76);
     }
