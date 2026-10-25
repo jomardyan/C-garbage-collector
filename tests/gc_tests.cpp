@@ -163,7 +163,7 @@ GC_NOINLINE void make_cycle() {
 }
 
 GC_NOINLINE void make_reachable_chain() {
-    auto root = gc::gc_new<Node>(1);
+    gc::gc_root<Node> root(gc::gc_new<Node>(1));
     root->next = gc::gc_new<Node>(2);
     root->next->next = gc::gc_new<Node>(3);
 
@@ -231,9 +231,7 @@ void test_deep_reachable_chain() {
            "deep chain should be reclaimed after its last root is dropped");
 }
 
-void test_interior_pointer() {
-    reset_gc();
-
+GC_NOINLINE void keep_interior_pointer_alive() {
     auto buffer = gc::gc_new<Buffer>();
     volatile std::uintptr_t interior = reinterpret_cast<std::uintptr_t>(&buffer->values[3]);
     buffer.reset();
@@ -244,6 +242,11 @@ void test_interior_pointer() {
            "interior pointer should keep the parent block alive");
 
     interior = 0U;
+}
+
+void test_interior_pointer() {
+    reset_gc();
+    keep_interior_pointer_alive();
     collect_until_stable();
 
     expect(gc::GC_Manager::instance().managed_block_count() == 0U,
@@ -305,15 +308,18 @@ void test_threshold_trigger() {
     collect_until_stable();
 }
 
-void test_over_aligned_allocation() {
-    reset_gc();
-
+GC_NOINLINE void allocate_over_aligned_object() {
     auto object = gc::gc_new<OverAlignedBlob>();
     expect(object.get() != nullptr, "over-aligned allocation should succeed");
     expect(reinterpret_cast<std::uintptr_t>(object.get()) % alignof(OverAlignedBlob) == 0U,
            "gc_new should preserve requested payload alignment");
 
     object.reset();
+}
+
+void test_over_aligned_allocation() {
+    reset_gc();
+    allocate_over_aligned_object();
     collect_until_stable();
 
     expect(gc::GC_Manager::instance().managed_block_count() == 0U,

@@ -33,8 +33,12 @@ The easiest way to start a single-threaded program is automatic thread registrat
 ```cpp
 #include "gc/GC.hpp"
 
+struct MyNode {
+    gc::gc_ptr<MyNode> next;
+};
+
 int main() {
-    gc::register_current_thread();
+    gc::ScopedThreadRegistration registration;
 
     gc::gc_root<MyNode> root(gc::gc_new<MyNode>());
     root->next = gc::gc_new<MyNode>();
@@ -63,7 +67,7 @@ Every mutator thread must register before using the GC. The RAII helper is the e
 void worker() {
     gc::ScopedThreadRegistration registration;
 
-    auto object = gc::gc_new<MyNode>();
+    gc::gc_root<MyNode> object(gc::gc_new<MyNode>());
     while (running) {
         gc::safepoint();
         do_work(object);
@@ -71,7 +75,11 @@ void worker() {
 }
 ```
 
-The collector uses a cooperative stop-the-world model. Registered worker threads must either be inside GC API calls or periodically call `gc::safepoint()` so collection can park them and scan their stacks.
+The collector uses a cooperative stop-the-world model. Every registered thread must periodically call `gc::safepoint()` or a manager API so collection can park it and scan its stack. `live_objects()` and `dump_heap()` also park mutators before reading their payloads. Nested `ScopedThreadRegistration` scopes preserve the outer registration, including an existing manual registration.
+
+A registered thread must not block indefinitely in `join()`, a condition-variable wait, or an application mutex while another thread may collect. A collector waits for that thread to reach a safepoint. For a joining thread that holds no GC roots, defer registration until after the join, as in `examples/worker_threads.cpp`. Never unregister a thread that still owns the only roots to live objects.
+
+Application data still needs normal C++ synchronization. Different threads must not concurrently mutate the same handle or payload without synchronization. Weak handles must be used on registered threads; `lock()` promotes a live target to a `gc_ptr`, which should be placed in a `gc_root` if it must survive later safepoints.
 
 ## Explicit Roots
 
@@ -104,7 +112,7 @@ auto live = gc::GC_Manager::instance().live_objects();
 gc::GC_Manager::instance().dump_heap(std::cout);
 ```
 
-`live_objects()` returns per-object payload size, reserved size, alignment, mark state, and outgoing references. `dump_heap()` emits a human-readable heap snapshot and object graph.
+`live_objects()` returns per-object payload size, reserved size, alignment, mark state, and outgoing references. `dump_heap()` emits a human-readable heap snapshot and object graph. Snapshot addresses are diagnostic values; they do not extend object lifetimes. Each query is a separate snapshot, so concurrent allocations can change counts between queries.
 
 ## Build and Run
 
@@ -124,7 +132,15 @@ Sample programs are built by default under `build/examples/`:
 ./build/examples/gc_example_worker_threads
 ```
 
-Set `-DGC_BUILD_EXAMPLES=OFF` if you want a smaller library-only build.
+For a library-only build:
+
+```bash
+cmake -S . -B build/lib -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=OFF -DGC_BUILD_DEMO=OFF -DGC_BUILD_EXAMPLES=OFF
+cmake --build build/lib --parallel
+```
+
+These optional targets default to off when the project is included with `add_subdirectory()`. Use `-DBUILD_SHARED_LIBS=ON` to build a shared library.
 
 The library also exposes install/export metadata for downstream CMake consumers:
 
@@ -134,12 +150,52 @@ cmake --build build
 cmake --install build --prefix /tmp/gclib-install
 ```
 
+Downstream projects inherit the C++20 and thread requirements from the exported target:
+
+```cmake
+find_package(GCLib 0.1 CONFIG REQUIRED)
+add_executable(my_app main.cpp)
+target_link_libraries(my_app PRIVATE GCLib::gc_lib)
+```
+
+Pass `-DCMAKE_PREFIX_PATH=/tmp/gclib-install` when configuring the consumer.
+
+## Validation
+
+```bash
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
+cmake --build build/release --parallel
+ctest --test-dir build/release --output-on-failure
+
+cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGC_ENABLE_ASAN=ON
+cmake --build build/asan --parallel
+ctest --test-dir build/asan --output-on-failure
+
+cmake -S . -B build/tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGC_ENABLE_TSAN=ON
+cmake --build build/tsan --parallel
+ctest --test-dir build/tsan --output-on-failure
+```
+
+Sanitizers require GCC or Clang and must use separate build directories; ASan and TSan cannot be enabled together. Instrumentation covers the library, public templates, tests, and examples. Only the scanner's raw conservative reads are excluded from TSan instrumentation. CTest sets `ASAN_OPTIONS=detect_stack_use_after_return=0`; use the same setting when running ASan examples directly. ASan scanning skips poisoned words. Tests cover construction failures, nested roots, shutdown/reuse, concurrent collection and snapshots, weak promotion, global BSS roots, and installed-package consumption.
+
+CI runs Linux Release, Debug/shared, ASan/UBSan, and TSan builds, plus macOS and Windows builds. A local Linux pass does not validate other operating systems; check the corresponding CI jobs before release.
+
+## Lifetime and Finalization
+
+`gc_ptr` is a lightweight pointer value. It keeps its target reachable only when its storage is scanned. Prefer `gc_root` for locals that must survive collection in optimized builds, and register ranges for handles stored in ordinary heap allocations. The collector does not follow storage owned by `std::vector`, `std::map`, or other native heap containers automatically. Root each target explicitly or register the container's live element storage, updating ranges whenever it reallocates.
+
+Allocations are pinned while their constructors run, so nested allocation and `collect()` are safe during construction. Failed construction releases the allocation and destroys only completed array elements. Calling `shutdown()` while construction is active throws `std::logic_error`.
+
+Finalizers run on the collecting thread while other mutators are parked. They must not wait for those threads, throw, or resurrect objects being finalized. References discovered between unreachable objects determine finalization order for acyclic dependencies. Cycles have no safe dependency order; a finalizer must not dereference another object in the same unreachable cycle. Recursive `collect()` and `shutdown()` from a finalizer are no-ops.
+
+`shutdown()` forcefully destroys all current allocations, including rooted objects, clears weak handles, and resets statistics. Strong handles become dangling and must be reset before further use. Root registrations and thread registrations survive shutdown, allowing existing root storage to be reused for new allocations. Unregister every explicit range before its backing storage is freed. GC handles must be destroyed before the manager singleton; explicitly shut down after workers have exited and before application resources used by finalizers are destroyed.
+
 ## Platform Notes
 
-- Linux scans writable file-backed mappings from `/proc/self/maps` and skips `[heap]` so collector bookkeeping does not self-root the heap.
+- Linux scans writable ELF load segments, including anonymous zero-filled BSS tails, while excluding general process heap storage and collector allocation bookkeeping.
 - macOS scans selected `__DATA` and `__DATA_CONST` sections from loaded Mach-O images.
 - Windows scans committed read-write PE image sections through `VirtualQuery`.
-- AddressSanitizer builds disable Linux writable-mapping global scanning and run tests with `detect_stack_use_after_return=0`, because ASan fake-stack instrumentation conflicts with conservative stack scanning.
+- AddressSanitizer builds retain global scanning, skip poisoned words, and require `detect_stack_use_after_return=0` for conservative stack discovery.
 - Unsupported platforms still support stack scanning and explicit root registration, but automatic global scanning is disabled.
 
 ## Limitations
@@ -148,7 +204,8 @@ cmake --install build --prefix /tmp/gclib-install
 - Cooperative stop-the-world is not the same as preemptive OS-level thread suspension. Threads that never hit GC APIs or `gc::safepoint()` can delay collection.
 - The collector does not compact, move, or generationally age objects.
 - There are no write barriers, incremental barriers, or exact compiler-provided root maps.
-- Encoded or disguised pointers are not tracked.
+- Encoded or disguised pointers, thread-local variables, and pointers stored at unaligned addresses are not discovered automatically. Use exact roots or registered pointer-aligned storage. Interior pointer values may themselves be unaligned.
+- Arbitrary stack switching, fibers, coroutines with heap-hosted frames, and unloading modules during collection require application-managed explicit roots and lifetime coordination.
 
 ## Project Layout
 

@@ -4,6 +4,8 @@
 #include <csetjmp>
 #include <cstdint>
 #include <cstring>
+#include <exception>
+#include <limits>
 
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
@@ -20,9 +22,7 @@
 #endif
 
 #if defined(__linux__)
-#include <fstream>
-#include <sstream>
-#include <string>
+#include <link.h>
 #elif defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
@@ -42,9 +42,20 @@ namespace {
 #define GC_NOINLINE
 #endif
 
+// A conservative scan intentionally reads opaque words, including writable
+// runtime globals which can change outside the registered mutator threads.
+// Instrument application access normally; exclude only these raw root reads
+// from TSan's C++ object-access model.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((no_sanitize_thread))
+#endif
 void scan_words(const void* begin,
                 const void* end,
                 const RootScanner::CandidateVisitor& visitor) {
+    if (begin == nullptr || end == nullptr) {
+        return;
+    }
+
     auto start = reinterpret_cast<std::uintptr_t>(begin);
     auto finish = reinterpret_cast<std::uintptr_t>(end);
 
@@ -53,12 +64,18 @@ void scan_words(const void* begin,
     }
 
     const std::uintptr_t word_size = sizeof(std::uintptr_t);
-    start = (start + word_size - 1U) & ~(word_size - 1U);
+    const auto padding = (word_size - start % word_size) % word_size;
+    if (finish - start < padding) {
+        return;
+    }
+    start += padding;
 
-    for (std::uintptr_t cur = start; cur + word_size <= finish; cur += word_size) {
+    // Subtraction avoids wrapping at the top of the address space, both when
+    // aligning the start and when deciding whether a complete word remains.
+    for (std::uintptr_t cur = start; finish - cur >= word_size; cur += word_size) {
         const void* word_address = reinterpret_cast<const void*>(cur);
 #if defined(GC_HAS_ASAN)
-    if (__asan_region_is_poisoned(const_cast<void*>(word_address), word_size) != nullptr) {
+        if (__asan_region_is_poisoned(const_cast<void*>(word_address), word_size) != nullptr) {
             continue;
         }
 #endif
@@ -69,9 +86,9 @@ void scan_words(const void* begin,
     }
 }
 
-// setjmp flushes caller-saved registers into the jmp_buf on most ABIs (x86-64,
-// AArch64, RISC-V).  On some ABIs a register window may be missed; the
-// conservative stack scan below provides a second line of defence.
+// setjmp captures the callee-saved registers on supported ABIs. Caller-saved
+// registers do not reliably retain roots across calls; use gc_root for exact
+// local rooting in optimized code.
 GC_NOINLINE void scan_registers_frame(
     const RootScanner::CandidateVisitor& visitor,
     std::uintptr_t zero0,
@@ -134,99 +151,54 @@ void scan_stack_range(const void* stack_top,
 
 #if defined(__linux__)
 
-#if !defined(GC_HAS_ASAN)
+// ELF segment sizes include anonymous zero-filled BSS tails, which cannot be
+// associated with their image by looking only at named /proc/self/maps lines.
+// The loader also keeps images mapped while dl_iterate_phdr's callback runs.
+struct LinuxScanContext {
+    const RootScanner::CandidateVisitor& visitor;
+    std::exception_ptr error;
+};
 
-namespace {
-
-std::string trim_left(std::string value) {
-    const auto first = value.find_first_not_of(' ');
-    if (first == std::string::npos) {
-        return {};
+int scan_linux_image(dl_phdr_info* image, std::size_t, void* opaque) noexcept {
+    auto& context = *static_cast<LinuxScanContext*>(opaque);
+    try {
+        for (std::size_t i = 0; i < image->dlpi_phnum; ++i) {
+            const auto& segment = image->dlpi_phdr[i];
+            if (segment.p_type != PT_LOAD ||
+                (segment.p_flags & (PF_R | PF_W)) != (PF_R | PF_W) ||
+                segment.p_memsz == 0) {
+                continue;
+            }
+            const auto begin = static_cast<std::uintptr_t>(image->dlpi_addr) +
+                               static_cast<std::uintptr_t>(segment.p_vaddr);
+            if (segment.p_memsz > std::numeric_limits<std::uintptr_t>::max() - begin) {
+                continue;
+            }
+            scan_words(reinterpret_cast<const void*>(begin),
+                       reinterpret_cast<const void*>(begin + segment.p_memsz),
+                       context.visitor);
+        }
+    } catch (...) {
+        // Never unwind a throwing visitor through the loader's C callback.
+        context.error = std::current_exception();
+        return 1;
     }
-    value.erase(0, first);
-    return value;
+    return 0;
 }
-
-bool should_scan_linux_mapping(const std::string& permissions,
-                               const std::string& path) {
-    if (permissions.size() < 2 || permissions[0] != 'r' || permissions[1] != 'w') {
-        return false;
-    }
-    if (path.empty()) {
-        return false;
-    }
-    // Skip kernel-managed pseudo-regions and the process heap (scanning the
-    // heap would treat GC bookkeeping as roots and pin everything).
-    if (path == "[heap]" || path == "[stack]" || path == "[vdso]" ||
-        path == "[vvar]" || path == "[vsyscall]") {
-        return false;
-    }
-    return path.front() != '[';
-}
-
-}  // namespace
-
-#endif
 
 void scan_globals(const RootScanner::CandidateVisitor& visitor) {
-#if defined(GC_HAS_ASAN)
-    (void)visitor;
-    // ASan injects poisoned redzones and bookkeeping into writable module
-    // mappings. Scanning those mappings causes invalid reads and pervasive
-    // false positives that pin the managed heap, so sanitizer builds fall back
-    // to stack scanning plus explicit root registration.
-    return;
-#else
-    std::ifstream maps("/proc/self/maps");
-    if (!maps.is_open()) {
-        return;
+    LinuxScanContext context{visitor, {}};
+    dl_iterate_phdr(scan_linux_image, &context);
+    if (context.error) {
+        std::rethrow_exception(context.error);
     }
-
-    std::string line;
-    while (std::getline(maps, line)) {
-        std::istringstream stream(line);
-        std::string address_range, permissions, offset, device, inode;
-
-        if (!(stream >> address_range >> permissions >> offset >> device >> inode)) {
-            continue;
-        }
-
-        std::string path;
-        std::getline(stream, path);
-        path = trim_left(path);
-
-        if (!should_scan_linux_mapping(permissions, path)) {
-            continue;
-        }
-
-        const auto sep = address_range.find('-');
-        if (sep == std::string::npos) {
-            continue;
-        }
-
-        std::uintptr_t begin = 0;
-        std::uintptr_t end = 0;
-        try {
-            begin = static_cast<std::uintptr_t>(
-                std::stoull(address_range.substr(0, sep), nullptr, 16));
-            end = static_cast<std::uintptr_t>(
-                std::stoull(address_range.substr(sep + 1), nullptr, 16));
-        } catch (...) {
-            continue;
-        }
-
-        scan_words(reinterpret_cast<const void*>(begin),
-                   reinterpret_cast<const void*>(end),
-                   visitor);
-    }
-#endif
 }
 
 #elif defined(__APPLE__)
 
 // Scan __DATA and __DATA_CONST segments of every loaded Mach-O image.
-// getsectiondata() returns the already-slid (runtime) address, so no manual
-// ASLR correction is needed.
+// getsectiondata() computes the image slide from __TEXT and returns the runtime
+// address. Applying _dyld_get_image_vmaddr_slide() again would double-slide it.
 void scan_globals(const RootScanner::CandidateVisitor& visitor) {
     const uint32_t image_count = _dyld_image_count();
 
@@ -264,10 +236,8 @@ void scan_globals(const RootScanner::CandidateVisitor& visitor) {
             continue;
         }
         for (const auto& s : kSections) {
-            uint32_t sz = 0U;
-            const uint8_t* ptr =
-                getsectiondata(reinterpret_cast<const mach_header_64*>(mh),
-                               s.seg, s.sect, reinterpret_cast<unsigned long*>(&sz));
+            unsigned long sz = 0U;
+            const uint8_t* ptr = getsectiondata(mh, s.seg, s.sect, &sz);
             if (ptr != nullptr && sz > 0U) {
                 scan_words(ptr, ptr + sz, visitor);
             }
@@ -287,7 +257,9 @@ void scan_globals(const RootScanner::CandidateVisitor& visitor) {
     while (VirtualQuery(address, &mbi, sizeof(mbi)) == sizeof(mbi)) {
         const bool readable_writable =
             (mbi.Protect & PAGE_READWRITE) != 0U ||
-            (mbi.Protect & PAGE_WRITECOPY) != 0U;
+            (mbi.Protect & PAGE_WRITECOPY) != 0U ||
+            (mbi.Protect & PAGE_EXECUTE_READWRITE) != 0U ||
+            (mbi.Protect & PAGE_EXECUTE_WRITECOPY) != 0U;
 
         if (mbi.State == MEM_COMMIT &&
             readable_writable &&
@@ -300,7 +272,7 @@ void scan_globals(const RootScanner::CandidateVisitor& visitor) {
 
         const auto next =
             reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-        if (next == 0U) {
+        if (next <= reinterpret_cast<std::uintptr_t>(mbi.BaseAddress)) {
             break;  // wrapped around top of address space
         }
         address = reinterpret_cast<LPVOID>(next);

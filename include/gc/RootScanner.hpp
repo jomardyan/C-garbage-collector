@@ -11,6 +11,9 @@ public:
 
     static void* current_fake_stack_handle() noexcept;
     static void scan(const void* stack_bottom, const CandidateVisitor& visitor);
+    /// Visits complete, naturally aligned pointer-sized words in [begin, end).
+    /// Reversed endpoints are normalized; null endpoints produce an empty scan.
+    /// The caller must keep the range readable for the duration of the scan.
     static void scan_range(const void* begin,
                            const void* end,
                            const CandidateVisitor& visitor);

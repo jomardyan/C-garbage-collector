@@ -1,33 +1,61 @@
 cmake_minimum_required(VERSION 3.20)
 project(GCLib VERSION 0.1.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+set(GC_TOP_LEVEL OFF)
+if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+    set(GC_TOP_LEVEL ON)
+endif()
+option(BUILD_TESTING "Build tests" ${GC_TOP_LEVEL})
+option(GC_BUILD_DEMO "Build the demonstration executable" ${GC_TOP_LEVEL})
+option(GC_BUILD_EXAMPLES "Build example programs" ${GC_TOP_LEVEL})
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-enable_testing()
+include(CTest)
+find_package(Threads REQUIRED)
 
 # ---- Sanitizers -------------------------------------------------------------
 option(GC_ENABLE_ASAN  "Build with AddressSanitizer + UBSan"  OFF)
 option(GC_ENABLE_TSAN  "Build with ThreadSanitizer"           OFF)
 
-function(gc_enable_sanitizers target sanitize_sources)
+if(GC_ENABLE_ASAN AND GC_ENABLE_TSAN)
+    message(FATAL_ERROR "GC_ENABLE_ASAN and GC_ENABLE_TSAN cannot be enabled together")
+endif()
+if((GC_ENABLE_ASAN OR GC_ENABLE_TSAN) AND
+   NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
+    message(FATAL_ERROR "GC sanitizer builds require GCC or Clang")
+endif()
+
+function(gc_enable_sanitizers target)
+    # Consumers must link the sanitizer runtime, including installed static builds.
+    # PUBLIC compilation also instruments inline allocation and pointer helpers.
+    get_target_property(target_type ${target} TYPE)
+    if(target_type MATCHES "LIBRARY$")
+        set(scope PUBLIC)
+    else()
+        set(scope PRIVATE)
+    endif()
     if(GC_ENABLE_ASAN)
-        if(${sanitize_sources})
-            target_compile_options(${target} PRIVATE
-                -fsanitize=address,undefined
-                -fno-omit-frame-pointer
-                -fno-sanitize-address-use-after-scope)
-        endif()
-        target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+        target_compile_options(${target} ${scope}
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+            -fno-sanitize-address-use-after-scope)
+        target_link_options(${target} ${scope} -fsanitize=address,undefined)
     elseif(GC_ENABLE_TSAN)
-        if(${sanitize_sources})
-            target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
-        endif()
-        target_link_options(${target} PRIVATE -fsanitize=thread)
+        target_compile_options(${target} ${scope}
+            -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(${target} ${scope} -fsanitize=thread)
+    endif()
+endfunction()
+
+function(gc_enable_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 endfunction()
 
@@ -39,7 +67,14 @@ add_library(gc_lib
 
 add_library(GCLib::gc_lib ALIAS gc_lib)
 
-set_target_properties(gc_lib PROPERTIES OUTPUT_NAME "GC-Lib")
+set_target_properties(gc_lib PROPERTIES
+    OUTPUT_NAME "GC-Lib"
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
+)
+target_compile_features(gc_lib PUBLIC cxx_std_20)
+target_link_libraries(gc_lib PUBLIC Threads::Threads)
 
 target_include_directories(gc_lib
     PUBLIC
@@ -47,45 +82,60 @@ target_include_directories(gc_lib
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-if(MSVC)
-    target_compile_options(gc_lib PRIVATE /W4 /permissive-)
-else()
-    target_compile_options(gc_lib PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-gc_enable_sanitizers(gc_lib TRUE)
+gc_enable_warnings(gc_lib)
+gc_enable_sanitizers(gc_lib)
 
 # ---- Demo executable --------------------------------------------------------
-add_executable(gc_demo src/main.cpp)
-target_link_libraries(gc_demo PRIVATE gc_lib)
-if(MSVC)
-    target_compile_options(gc_demo PRIVATE /W4 /permissive-)
-else()
-    target_compile_options(gc_demo PRIVATE -Wall -Wextra -Wpedantic)
+if(GC_BUILD_DEMO)
+    add_executable(gc_demo src/main.cpp)
+    target_link_libraries(gc_demo PRIVATE gc_lib)
+    gc_enable_warnings(gc_demo)
 endif()
-
-gc_enable_sanitizers(gc_demo FALSE)
 
 # ---- Tests ------------------------------------------------------------------
-add_executable(gc_tests tests/gc_tests.cpp)
-target_link_libraries(gc_tests PRIVATE gc_lib)
-if(MSVC)
-    target_compile_options(gc_tests PRIVATE /W4 /permissive-)
-else()
-    target_compile_options(gc_tests PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+if(BUILD_TESTING)
+    function(gc_register_test target)
+        gc_enable_warnings(${target})
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES TIMEOUT 120)
+        if(GC_ENABLE_ASAN)
+            set_tests_properties(${target} PROPERTIES
+                ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=0")
+        endif()
+    endfunction()
+    function(gc_add_test target source)
+        add_executable(${target} ${source})
+        target_link_libraries(${target} PRIVATE gc_lib)
+        gc_register_test(${target})
+    endfunction()
+    gc_add_test(gc_tests tests/gc_tests.cpp)
+    gc_add_test(gc_core_regressions tests/core_regressions.cpp)
+    gc_add_test(gc_handle_tests tests/handle_tests.cpp)
+    gc_add_test(gc_scanner_tests tests/scanner_tests.cpp)
+    # Link the subject directly so replacement operator new also intercepts its
+    # bookkeeping allocations on platforms without DLL symbol interposition.
+    add_executable(gc_allocation_failure_tests
+        tests/allocation_failure_tests.cpp src/GCManager.cpp src/RootScanner.cpp)
+    target_include_directories(gc_allocation_failure_tests PRIVATE include)
+    target_compile_features(gc_allocation_failure_tests PRIVATE cxx_std_20)
+    target_link_libraries(gc_allocation_failure_tests PRIVATE Threads::Threads)
+    gc_enable_sanitizers(gc_allocation_failure_tests)
+    gc_register_test(gc_allocation_failure_tests)
 
-gc_enable_sanitizers(gc_tests FALSE)
-
-add_test(NAME gc_tests COMMAND gc_tests)
-if(GC_ENABLE_ASAN)
-    set_tests_properties(gc_tests PROPERTIES
-        ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=0")
+    add_test(NAME gc_package_consumer
+        COMMAND ${CMAKE_COMMAND}
+            -DGC_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -DGC_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
+            -DGC_CONFIG=$<CONFIG>
+            -DGC_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+            -DGC_GENERATOR=${CMAKE_GENERATOR}
+            -DGC_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}
+            -DGC_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/TestInstalledPackage.cmake)
+    set_tests_properties(gc_package_consumer PROPERTIES TIMEOUT 120)
 endif()
 
 # ---- Examples ---------------------------------------------------------------
-option(GC_BUILD_EXAMPLES "Build example programs" ON)
-
 if(GC_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()

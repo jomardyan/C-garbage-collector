@@ -31,7 +31,7 @@ public:
 
     gc_root(const gc_root& other) : ptr_(other.ptr_) { register_self(); }
 
-    gc_root(gc_root&& other) noexcept : ptr_(other.ptr_) {
+    gc_root(gc_root&& other) : ptr_(other.ptr_) {
         register_self();
         other.ptr_ = nullptr;
     }
@@ -93,7 +93,7 @@ public:
 
     gc_root(const gc_root& other) : ptr_(other.ptr_) { register_self(); }
 
-    gc_root(gc_root&& other) noexcept : ptr_(other.ptr_) {
+    gc_root(gc_root&& other) : ptr_(other.ptr_) {
         register_self();
         other.ptr_ = nullptr;
     }

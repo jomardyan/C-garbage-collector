@@ -2,13 +2,7 @@ function(gc_add_example target source)
     add_executable(${target} ${source})
     target_link_libraries(${target} PRIVATE gc_lib)
 
-    if(MSVC)
-        target_compile_options(${target} PRIVATE /W4 /permissive-)
-    else()
-        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
-    endif()
-
-    gc_enable_sanitizers(${target} FALSE)
+    gc_enable_warnings(${target})
 endfunction()
 
 gc_add_example(gc_example_quick_start quick_start.cpp)

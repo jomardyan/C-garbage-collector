@@ -1,8 +1,8 @@
 # Copilot Instructions for C-garbage-collector
 
 ## Project Goals
-- Build `GC-Lib`, a compact educational conservative garbage collector in modern C++.
-- Keep the default collector single-threaded and stop-the-world during `gc_new` threshold checks.
+- Build `GC-Lib`, a compact conservative garbage collector in modern C++.
+- Keep collection cooperative and stop-the-world; every mutator must register and reach safepoints.
 - Preserve a clean public API: `gc_ptr<T>`, `gc_new<T>()`, and `GC_Manager` for explicit control.
 
 ## Architecture Guidelines
@@ -29,6 +29,10 @@
   - Interior-pointer retention.
   - Cycles that are unreachable from roots.
   - Threshold-triggered collection.
+  - Nested construction and registration lifetimes.
+  - Weak-reference invalidation and managed handle storage.
+  - Installed CMake package consumption.
+- Run Release and sanitizer builds; avoid deterministic reclamation assumptions for ambiguous conservative roots.
 
 ## Copilot Contribution Style
 - Propose minimal diffs.

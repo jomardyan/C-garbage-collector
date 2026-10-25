@@ -61,6 +61,8 @@ public:
     /// Removes the current thread from the collector's registered thread set.
     void unregister_current_thread();
 
+    bool is_current_thread_registered() const;
+
     /// Cooperatively parks the current thread if another thread has started collection.
     void safepoint();
 
@@ -85,7 +87,7 @@ public:
     /// Returns cumulative collector timing and reclamation statistics.
     GCStats stats() const;
 
-    /// Returns a debug snapshot of every live object currently managed by the GC.
+    /// Parks registered mutators and snapshots the live heap and object graph.
     std::vector<HeapObjectInfo> live_objects() const;
 
     /// Writes a human-readable heap snapshot including outgoing references.
@@ -96,7 +98,10 @@ public:
 
     void* malloc_internal(std::size_t payload_size,
                           std::size_t payload_alignment,
-                          DestructorFn destructor);
+                          DestructorFn destructor,
+                          bool constructing = false);
+    /// Publishes an allocation after successful construction; does not collect.
+    void finish_construction(void* payload);
     void release_unconstructed(void* payload);
 
     void collect();
@@ -111,10 +116,13 @@ public:
     void unregister_weak_ref(std::uintptr_t* storage);
     // Called on move: re-register the same target under a new storage address.
     void update_weak_ref(std::uintptr_t* old_storage, std::uintptr_t* new_storage);
+    void copy_weak_ref(const std::uintptr_t* old_storage, std::uintptr_t* new_storage);
+    std::uintptr_t read_weak_ref(const std::uintptr_t* storage) const noexcept;
 
     template <typename T>
     void register_root_object(const T* object) {
         static_assert(!std::is_void_v<T>);
+        if (object == nullptr) return;
         auto* begin = static_cast<const void*>(object);
         auto* end = static_cast<const void*>(
             reinterpret_cast<const unsigned char*>(object) + sizeof(T));
@@ -124,6 +132,7 @@ public:
     template <typename T>
     void unregister_root_object(const T* object) {
         static_assert(!std::is_void_v<T>);
+        if (object == nullptr) return;
         auto* begin = static_cast<const void*>(object);
         auto* end = static_cast<const void*>(
             reinterpret_cast<const unsigned char*>(object) + sizeof(T));
@@ -144,6 +153,7 @@ private:
         ChunkHeader* header = nullptr;
         std::uintptr_t payload_begin = 0;
         std::uintptr_t payload_end = 0;
+        bool constructing = false;
     };
 
     struct RootRange {
@@ -207,7 +217,7 @@ private:
     std::size_t collection_threshold_bytes_ = 10U * 1024U * 1024U;
     std::thread::id collector_thread_;
     bool stop_the_world_requested_ = false;
-    // Atomic so it can be reset after destroy_blocks() without re-acquiring the mutex.
+    // Tracks collection through finalization; recursive collection is a no-op.
     std::atomic<bool> collecting_{false};
     GCStats stats_;
 };
@@ -216,19 +226,26 @@ private:
 class ScopedThreadRegistration {
 public:
     ScopedThreadRegistration() {
-        GC_Manager::instance().register_current_thread();
+        auto& manager = GC_Manager::instance();
+        owns_registration_ = !manager.is_current_thread_registered();
+        if (owns_registration_) manager.register_current_thread();
     }
 
     explicit ScopedThreadRegistration(const void* stack_bottom) {
-        GC_Manager::instance().register_stack_bottom(stack_bottom);
+        auto& manager = GC_Manager::instance();
+        owns_registration_ = !manager.is_current_thread_registered();
+        if (owns_registration_) manager.register_stack_bottom(stack_bottom);
     }
 
     ~ScopedThreadRegistration() {
-        GC_Manager::instance().unregister_current_thread();
+        if (owns_registration_) GC_Manager::instance().unregister_current_thread();
     }
 
     ScopedThreadRegistration(const ScopedThreadRegistration&) = delete;
     ScopedThreadRegistration& operator=(const ScopedThreadRegistration&) = delete;
+
+private:
+    bool owns_registration_ = false;
 };
 
 /// RAII helper for registering and unregistering an explicit root memory range.
@@ -268,17 +285,17 @@ public:
     }
 
     void reset(const void* begin = nullptr, const void* end = nullptr) {
+        const bool register_new = begin != nullptr && end != nullptr && begin != end;
+        if (register_new) {
+            GC_Manager::instance().register_root_range(begin, end);
+        }
         if (registered_) {
             GC_Manager::instance().unregister_root_range(begin_, end_);
         }
 
         begin_ = begin;
         end_ = end;
-        registered_ = begin_ != nullptr && end_ != nullptr && begin_ != end_;
-
-        if (registered_) {
-            GC_Manager::instance().register_root_range(begin_, end_);
-        }
+        registered_ = register_new;
     }
 
     const void* begin() const noexcept { return begin_; }
@@ -324,15 +341,14 @@ public:
     }
 
     void reset(const T* object = nullptr) {
+        if (object != nullptr) {
+            GC_Manager::instance().register_root_object(object);
+        }
         if (object_ != nullptr) {
             GC_Manager::instance().unregister_root_object(object_);
         }
 
         object_ = object;
-
-        if (object_ != nullptr) {
-            GC_Manager::instance().register_root_object(object_);
-        }
     }
 
     const T* get() const noexcept { return object_; }

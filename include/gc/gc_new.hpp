@@ -25,18 +25,17 @@ gc_ptr<T> gc_new(Args&&... args) {
     manager.collect_if_needed(sizeof(T));
 
     void* payload =
-        manager.malloc_internal(sizeof(T), alignof(T), &GC_Manager::destroy_object<T>);
+        manager.malloc_internal(sizeof(T), alignof(T), &GC_Manager::destroy_object<T>, true);
 
     try {
-        new (payload) T(std::forward<Args>(args)...);
+        ::new (payload) T(std::forward<Args>(args)...);
     } catch (...) {
         manager.release_unconstructed(payload);
         throw;
     }
 
-    gc_ptr<T> result(static_cast<T*>(payload));
-    manager.collect_if_needed();
-    return result;
+    manager.finish_construction(payload);
+    return gc_ptr<T>(static_cast<T*>(payload));
 }
 
 /// Allocates and constructs one GC-managed object, returning null on failure.
@@ -136,7 +135,7 @@ gc_ptr<T[]> gc_new_array(std::size_t count) {
 
     void* payload = manager.malloc_internal(
         payload_size, alignment,
-        &detail::ArrayDestructor<T>::destroy);
+        &detail::ArrayDestructor<T>::destroy, true);
 
     auto* prefix = static_cast<std::size_t*>(payload);
     T* elems = detail::array_elements_begin<T>(payload);
@@ -148,7 +147,7 @@ gc_ptr<T[]> gc_new_array(std::size_t count) {
     std::size_t constructed = 0U;
     try {
         for (; constructed < count; ++constructed) {
-            new (elems + constructed) T();
+            ::new (static_cast<unsigned char*>(payload) + prefix_size + constructed * sizeof(T)) T();
             *prefix = constructed + 1U;  // keep count current for the destructor
         }
     } catch (...) {
@@ -160,9 +159,8 @@ gc_ptr<T[]> gc_new_array(std::size_t count) {
         throw;
     }
 
-    gc_ptr<T[]> result(elems);
-    manager.collect_if_needed();
-    return result;
+    manager.finish_construction(payload);
+    return gc_ptr<T[]>(elems);
 }
 
 }  // namespace gc

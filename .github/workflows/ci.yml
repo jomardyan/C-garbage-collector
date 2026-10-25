@@ -4,67 +4,82 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build-and-test:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: "GCC 12 – Release"
+          - name: GCC Release
             os: ubuntu-22.04
-            cc: gcc-12
             cxx: g++-12
             build_type: Release
-            extra_cmake: ""
-
-          - name: "Clang 15 – Release"
+            shared: OFF
+          - name: GCC Debug shared
             os: ubuntu-22.04
-            cc: clang-15
+            cxx: g++-12
+            build_type: Debug
+            shared: ON
+          - name: Clang Release
+            os: ubuntu-22.04
             cxx: clang++-15
             build_type: Release
-            extra_cmake: ""
-
-          - name: "Clang 15 – ASan + UBSan"
+            shared: OFF
+          - name: Clang ASan + UBSan
             os: ubuntu-22.04
-            cc: clang-15
             cxx: clang++-15
             build_type: RelWithDebInfo
-            extra_cmake: "-DGC_ENABLE_ASAN=ON"
-
-          - name: "Clang 15 – TSan"
+            shared: OFF
+            extra_cmake: -DGC_ENABLE_ASAN=ON
+          - name: Clang TSan
             os: ubuntu-22.04
-            cc: clang-15
             cxx: clang++-15
             build_type: RelWithDebInfo
-            extra_cmake: "-DGC_ENABLE_TSAN=ON"
+            shared: OFF
+            extra_cmake: -DGC_ENABLE_TSAN=ON
+          - name: macOS Release
+            os: macos-latest
+            build_type: Release
+            shared: ON
+          - name: Windows Release
+            os: windows-latest
+            build_type: Release
+            shared: ON
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install Linux compilers
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y cmake ninja-build
-          if [[ "${{ matrix.cxx }}" == clang* ]]; then
-            sudo apt-get install -y "${{ matrix.cc }}" "${{ matrix.cxx }}" || \
-              (wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 15)
-          fi
+          sudo apt-get install -y cmake g++-12 clang-15
 
       - name: Configure
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
-            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            ${{ matrix.extra_cmake }}
+        shell: bash
+        env:
+          CXX: ${{ matrix.cxx }}
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DBUILD_SHARED_LIBS=${{ matrix.shared }}
+          ${{ matrix.extra_cmake }}
 
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
 
-      - name: Test
-        run: ctest --test-dir build --output-on-failure --parallel 1
+      - name: Test including installed package
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --parallel 1
+
+      - name: Verify library-only configuration
+        run: >-
+          cmake -S . -B build-library-only
+          -DBUILD_TESTING=OFF -DGC_BUILD_DEMO=OFF -DGC_BUILD_EXAMPLES=OFF

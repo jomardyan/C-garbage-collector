@@ -32,8 +32,6 @@ void worker(std::atomic<int>& completed_jobs, int worker_id) {
 }  // namespace
 
 int main() {
-    gc::register_current_thread();
-
     std::atomic<int> completed_jobs = 0;
     std::thread left(worker, std::ref(completed_jobs), 1);
     std::thread right(worker, std::ref(completed_jobs), 2);
@@ -41,6 +39,9 @@ int main() {
     left.join();
     right.join();
 
+    // The main thread holds no GC roots while joining. Register only after the
+    // join so a worker's threshold collection never waits for this blocked thread.
+    gc::ScopedThreadRegistration thread_registration;
     gc::collect();
     std::cout << "Completed worker iterations: " << completed_jobs.load() << '\n';
 

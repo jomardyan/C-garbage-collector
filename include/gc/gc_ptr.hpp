@@ -34,13 +34,13 @@ public:
 
     constexpr T* get() const noexcept { return ptr_; }
 
-    constexpr T& operator*() const noexcept {
-        static_assert(!std::is_void_v<T>, "gc_ptr<void> cannot be dereferenced.");
+    constexpr std::add_lvalue_reference_t<T> operator*() const noexcept
+        requires (!std::is_void_v<T>) {
         return *ptr_;
     }
 
-    constexpr T* operator->() const noexcept {
-        static_assert(!std::is_void_v<T>, "gc_ptr<void> does not support operator->.");
+    constexpr T* operator->() const noexcept
+        requires (!std::is_void_v<T>) {
         return ptr_;
     }
 
@@ -64,6 +64,22 @@ public:
     constexpr gc_ptr() noexcept = default;
     constexpr gc_ptr(std::nullptr_t) noexcept {}
     explicit constexpr gc_ptr(T* ptr) noexcept : ptr_(ptr) {}
+
+    template <typename U>
+        requires std::is_convertible_v<U (*)[], T (*)[]>
+    constexpr gc_ptr(const gc_ptr<U[]>& other) noexcept : ptr_(other.get()) {}
+
+    template <typename U>
+        requires std::is_convertible_v<U (*)[], T (*)[]>
+    constexpr gc_ptr& operator=(const gc_ptr<U[]>& other) noexcept {
+        ptr_ = other.get();
+        return *this;
+    }
+
+    constexpr gc_ptr& operator=(std::nullptr_t) noexcept {
+        ptr_ = nullptr;
+        return *this;
+    }
 
     constexpr T* get() const noexcept { return ptr_; }
 
@@ -91,21 +107,21 @@ constexpr bool operator==(const gc_ptr<T>& lhs, std::nullptr_t) noexcept {
 // --- Ordering (required for std::map / std::set keys) ---
 template <typename T, typename U>
 constexpr bool operator<(const gc_ptr<T>& lhs, const gc_ptr<U>& rhs) noexcept {
-    return std::less<const void*>{}(static_cast<const void*>(lhs.get()),
-                                    static_cast<const void*>(rhs.get()));
+    return std::less<const volatile void*>{}(static_cast<const volatile void*>(lhs.get()),
+                                             static_cast<const volatile void*>(rhs.get()));
 }
 
 // --- Swap ---
 template <typename T>
 constexpr void swap(gc_ptr<T>& lhs, gc_ptr<T>& rhs) noexcept {
-    T* tmp = lhs.get();
+    auto* tmp = lhs.get();
     lhs.reset(rhs.get());
     rhs.reset(tmp);
 }
 
 template <typename T>
 constexpr void swap(gc_ptr<T[]>& lhs, gc_ptr<T[]>& rhs) noexcept {
-    T* tmp = lhs.get();
+    auto* tmp = lhs.get();
     lhs.reset(rhs.get());
     rhs.reset(tmp);
 }
@@ -113,19 +129,19 @@ constexpr void swap(gc_ptr<T[]>& lhs, gc_ptr<T[]>& rhs) noexcept {
 /// Casts a gc_ptr using static_cast semantics.
 template <typename To, typename From>
 gc_ptr<To> static_gc_ptr_cast(const gc_ptr<From>& p) noexcept {
-    return gc_ptr<To>(static_cast<To*>(p.get()));
+    return gc_ptr<To>(static_cast<typename gc_ptr<To>::element_type*>(p.get()));
 }
 
 /// Casts a gc_ptr using dynamic_cast semantics.
 template <typename To, typename From>
 gc_ptr<To> dynamic_gc_ptr_cast(const gc_ptr<From>& p) noexcept {
-    return gc_ptr<To>(dynamic_cast<To*>(p.get()));
+    return gc_ptr<To>(dynamic_cast<typename gc_ptr<To>::element_type*>(p.get()));
 }
 
 /// Casts away constness from a gc_ptr target.
 template <typename To, typename From>
 gc_ptr<To> const_gc_ptr_cast(const gc_ptr<From>& p) noexcept {
-    return gc_ptr<To>(const_cast<To*>(p.get()));
+    return gc_ptr<To>(const_cast<typename gc_ptr<To>::element_type*>(p.get()));
 }
 
 }  // namespace gc
