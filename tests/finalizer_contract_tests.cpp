@@ -10,7 +10,26 @@
 #include <string_view>
 #include <thread>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace {
+
+[[noreturn]] void immediate_exit(int code) noexcept {
+#if defined(_WIN32)
+    // The collector may be a DLL with a live singleton. CRT process exit can
+    // run DLL detach and finalize that singleton again after this deliberate
+    // termination path. TerminateProcess skips detach and other exit callbacks.
+    ::TerminateProcess(::GetCurrentProcess(), static_cast<UINT>(code));
+    std::abort();  // Terminating the current process must not return.
+#else
+    std::_Exit(code);
+#endif
+}
 
 void expect(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -236,7 +255,7 @@ struct ThrowingCleanupElement {
         cleanup_trace("completed element destructor entered");
         // Verify this is cleanup of element zero after element one failed,
         // rather than termination from destroying an unexpected temporary.
-        if (attempts != 2 || index != 0) std::_Exit(78);
+        if (attempts != 2 || index != 0) immediate_exit(78);
         if (throw_from_destructor) {
             cleanup_trace("completed element destructor throws");
             throw FinalizerException{};
@@ -251,16 +270,16 @@ struct ThrowingCleanupElement {
     if (cleanup_termination_test) cleanup_trace("terminate handler entered");
     const auto error = std::current_exception();
     if (cleanup_termination_test) cleanup_trace("current_exception returned");
-    if (!error) std::_Exit(74);
+    if (!error) immediate_exit(74);
     try {
         if (cleanup_termination_test) cleanup_trace("rethrowing current exception");
         std::rethrow_exception(error);
     } catch (const FinalizerException&) {
         if (cleanup_termination_test) cleanup_trace("expected finalizer exception caught");
-        std::_Exit(73);
+        immediate_exit(73);
     } catch (...) {
         if (cleanup_termination_test) cleanup_trace("unexpected exception caught");
-        std::_Exit(75);
+        immediate_exit(75);
     }
 }
 
@@ -279,9 +298,9 @@ struct ThrowingCleanupElement {
     } catch (...) {
         // Do not let singleton teardown produce a false pass after a failure
         // in the collection/shutdown operation under test.
-        std::_Exit(76);
+        immediate_exit(76);
     }
-    std::_Exit(77);
+    immediate_exit(77);
 }
 
 [[noreturn]] void test_throwing_cleanup_finalizer() {
@@ -300,9 +319,9 @@ struct ThrowingCleanupElement {
         // Neither the original constructor exception nor the cleanup destructor
         // exception may escape after a finalizer has thrown.
         cleanup_trace("an exception escaped partial-array cleanup");
-        std::_Exit(76);
+        immediate_exit(76);
     }
-    std::_Exit(77);
+    immediate_exit(77);
 }
 
 }  // namespace

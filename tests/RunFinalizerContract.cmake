@@ -11,9 +11,9 @@ foreach(finalizer_mode IN ITEMS --throwing --throwing-collect --throwing-cleanup
         TIMEOUT 30
     )
 
-    # std::_Exit(73) in the terminate handler gives a stable exit status on
-    # Windows, macOS, and Linux. Crashes, timeouts, or the other failure codes
-    # must never count as the expected termination contract.
+    # immediate_exit(73) uses TerminateProcess on Windows to avoid DLL detach
+    # callbacks, and std::_Exit on macOS/Linux. Only this exact status from the
+    # terminate handler passes; crashes, timeouts, and other codes must fail.
     if(NOT "${finalizer_result}" STREQUAL "73")
         message(FATAL_ERROR
             "Throwing finalizer (${finalizer_mode}) must reach std::terminate with exit code 73; got '${finalizer_result}'.\n"
