@@ -299,3 +299,5 @@ Finalizers run on the collecting thread while other mutators are parked. They mu
 ├── tests/
 └── .github/workflows/
 ```
+
+[Maintenance audit and validation notes](docs/AUDIT-2026-11-04.md) documents the reviewed scope, development commands, checks and remaining limits.

@@ -41,3 +41,5 @@ gc_tests
 compile_commands.json
 .clangd/
 
+# Handwritten repository task entrypoint, not a generated CMake Makefile.
+!/Makefile
