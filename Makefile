@@ -14,7 +14,7 @@ help: ## Show supported commands without configuring a build
 	$(info make configure/build/test/lint/check/package/install/dev/clean)
 	$(info configure/build: Configure CMake and compile the library, examples and benchmarks.)
 	$(info test/check: Compile public-header checks and run CTest including installed consumers.)
-	$(info package: Stage installed files, license and copyright in dist/GCLib.tar.gz.)
+	$(info package: Stage installed files, project documentation and copyright in dist/GCLib.tar.gz.)
 	$(info install/dev/clean: Explicit local installation, separate Debug build, or guarded output cleanup.)
 	$(info Override CMAKE, CTEST, BUILD_DIR, BUILD_TYPE, DIST_DIR, PREFIX, JOBS and CMAKE_ARGS.)
 guard-build:
@@ -34,11 +34,11 @@ test: build ## Run CTest, including the installed-package consumer checks
 # Building also compiles every public header and enables compiler warnings.
 lint: build ## Compile public-header checks with the project warning settings
 check: lint test ## Build and run all configured tests in order
-package: build guard-dist ## Stage installed library, license and copyright in a tar.gz
+package: build guard-dist ## Stage installed library, project documentation and copyright in a tar.gz
 	"$(CMAKE)" -E make_directory "$(DIST_DIR)"
 	"$(CMAKE)" "-DROOT=$(CURDIR)" "-DOUTPUT=$(DIST_DIR)/GCLib" -DCLEAN=ON -P cmake/MakeOutputs.cmake
 	"$(CMAKE)" --install "$(BUILD_DIR)" --config "$(BUILD_TYPE)" --prefix "$(abspath $(DIST_DIR))/GCLib"
-	"$(CMAKE)" -E copy LICENSE COPYRIGHT.md "$(DIST_DIR)/GCLib/"
+	"$(CMAKE)" -E copy README.md COPYRIGHT.md "$(DIST_DIR)/GCLib/"
 	"$(CMAKE)" -E chdir "$(DIST_DIR)" "$(CMAKE)" -E tar cfvz GCLib.tar.gz --format=gnutar GCLib
 clean: ## Remove only the guarded selected build tree and distribution directory
 	"$(CMAKE)" "-DROOT=$(CURDIR)" "-DOUTPUT=$(BUILD_DIR)" -P cmake/MakeOutputs.cmake

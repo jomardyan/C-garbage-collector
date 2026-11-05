@@ -94,7 +94,7 @@ jobs:
         run: |
           make package BUILD_TYPE=Release JOBS=2
           tar -tzf dist/GCLib.tar.gz
-          test -f dist/GCLib/LICENSE
+          test -f dist/GCLib/README.md
           test -f dist/GCLib/COPYRIGHT.md
 
       - name: Configure library-only build
