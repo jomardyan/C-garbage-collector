@@ -11,12 +11,12 @@ CMAKE_ARGS ?=
 .NOTPARALLEL:
 .PHONY: help configure install dev test lint check build clean package guard-build guard-dist
 help: ## Show supported commands without configuring a build
-	@echo make configure/build/test/lint/check/package/install/dev/clean
-	@echo configure/build: Configure CMake and compile the library, examples and benchmarks.
-	@echo test/check: Compile public-header checks and run CTest including installed consumers.
-	@echo package: Stage installed files, license and copyright in dist/GCLib.tar.gz.
-	@echo install/dev/clean: Explicit local installation, separate Debug build, or guarded output cleanup.
-	@echo Override CMAKE, CTEST, BUILD_DIR, BUILD_TYPE, DIST_DIR, PREFIX, JOBS and CMAKE_ARGS.
+	$(info make configure/build/test/lint/check/package/install/dev/clean)
+	$(info configure/build: Configure CMake and compile the library, examples and benchmarks.)
+	$(info test/check: Compile public-header checks and run CTest including installed consumers.)
+	$(info package: Stage installed files, license and copyright in dist/GCLib.tar.gz.)
+	$(info install/dev/clean: Explicit local installation, separate Debug build, or guarded output cleanup.)
+	$(info Override CMAKE, CTEST, BUILD_DIR, BUILD_TYPE, DIST_DIR, PREFIX, JOBS and CMAKE_ARGS.)
 guard-build:
 	"$(CMAKE)" "-DROOT=$(CURDIR)" "-DOUTPUT=$(BUILD_DIR)" -P cmake/MakeOutputs.cmake
 guard-dist:
