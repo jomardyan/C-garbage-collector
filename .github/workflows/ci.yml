@@ -63,6 +63,11 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y cmake g++-12 clang-15
 
+      - name: Verify GNU Make command discovery and recipe graph
+        if: runner.os != 'Windows'
+        run: |
+          make help
+          make -n build package clean
       - name: Configure
         shell: bash
         env:
