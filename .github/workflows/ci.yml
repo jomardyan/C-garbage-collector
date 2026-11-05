@@ -89,6 +89,14 @@ jobs:
         if: matrix.build_type == 'Release'
         run: ctest --test-dir build -C ${{ matrix.build_type }} -L stress --repeat until-fail:3 --output-on-failure
 
+      - name: Validate the local Make distribution archive
+        if: matrix.name == 'GCC Release'
+        run: |
+          make package BUILD_TYPE=Release JOBS=2
+          tar -tzf dist/GCLib.tar.gz
+          test -f dist/GCLib/LICENSE
+          test -f dist/GCLib/COPYRIGHT.md
+
       - name: Configure library-only build
         env:
           CXX: ${{ matrix.cxx }}
